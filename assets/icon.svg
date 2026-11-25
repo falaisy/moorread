@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="書野 Moorread">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b3f6b" />
+      <stop offset="1" stop-color="#0b1d34" />
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" />
+      <stop offset="1" stop-color="#efece5" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)" />
+  <g transform="translate(256 264) scale(1.4) translate(-274 -285)">
+    <rect x="292" y="258" width="122" height="148" rx="20" fill="#05111f" opacity=".35" />
+    <rect x="286" y="250" width="122" height="148" rx="20" fill="url(#card)" />
+    <rect x="306" y="292" width="80" height="9" rx="4.5" fill="#c3cbcc" />
+    <rect x="306" y="322" width="84" height="9" rx="4.5" fill="#c3cbcc" />
+    <rect x="306" y="352" width="64" height="9" rx="4.5" fill="#c3cbcc" />
+    <path d="M140 232Q140 200 172 200H236Q268 200 268 232V380L204 344L140 380Z" fill="none" stroke="#f0952f" stroke-width="22" stroke-linejoin="round" stroke-linecap="round" />
+    <path d="M204 236V196Q204 172 228 172H302" fill="none" stroke="#f8f6f1" stroke-width="12" stroke-linecap="round" />
+    <circle cx="204" cy="236" r="24" fill="#f8f6f1" />
+    <circle cx="204" cy="236" r="9" fill="#dfe4e2" />
+    <circle cx="328" cy="172" r="19" fill="#f8f6f1" />
+    <circle cx="328" cy="172" r="8" fill="#dfe4e2" />
+  </g>
+</svg>

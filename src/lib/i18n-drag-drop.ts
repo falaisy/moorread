@@ -1,0 +1,73 @@
+import type { Language } from './types'
+
+export type DragDropMessageKey = keyof typeof zhTW
+type DragDropMessages = Record<DragDropMessageKey, string>
+
+const zhTW = {
+  dragGroup: '拖曳書籤群組 {name}',
+  dragToReorder: '拖曳排序',
+  dragGroupPinnedOnly: '書籤群組只能在群組頁或置頂頁排序',
+  dragGroupCannotMoveToFolder: '書籤群組不能移至書籤資料夾',
+  dragFolderCannotReorderBookmarks: '資料夾不能插入書籤順序',
+  dragSwitchToNativeOrder: '請先切換到「瀏覽器順序」再拖曳排序',
+  dragBookmarkPositionUnchanged: '書籤位置未變更',
+  dragSameFolderOnly: '只能在同一資料夾內排序；移動資料夾請拖曳到資料夾上',
+  dragPinnedGroupsCannotCross: '置頂書籤和一般書籤分組顯示，不能跨組排序',
+  dragMoveBefore: '將「{item}」移到「{target}」之前',
+  dragMoveAfter: '將「{item}」移到「{target}」之後',
+  dragMovedBefore: '已將「{item}」移到「{target}」之前',
+  dragMovedAfter: '已將「{item}」移到「{target}」之後',
+  dragAllIsNotFolder: '「全部」不是可放置的資料夾',
+  dragTargetFolderMissing: '目標資料夾不存在或已被刪除',
+  dragAlreadyInFolder: '「{item}」已位於「{target}」中',
+  dragMoveToFolder: '將「{item}」移到「{target}」',
+  dragMovedToFolder: '已將「{item}」移到「{target}」',
+  dragFolderCannotMove: '此資料夾不能移動',
+  dragCannotMoveIntoSelf: '不能將資料夾移到自身',
+  dragCannotMoveParentIntoChild: '不能將上層資料夾移到自己的子資料夾中',
+  dragMoveFailed: '移動失敗，請稍後再試',
+  dragScreenReaderInstructions: '按空白鍵開始拖曳，使用方向鍵選擇書籤位置或資料夾，再按空白鍵放置。按 Escape 取消。',
+  dragStartedNamed: '開始拖曳 {name}',
+  dragStarted: '開始拖曳',
+  dragNoDropPosition: '目前沒有可放置的位置',
+  dragEndedWithoutMove: '拖曳結束，沒有移動任何內容',
+  dragCancelledNamed: '已取消拖曳 {name}',
+  dragCancelled: '已取消拖曳',
+}
+
+const en: DragDropMessages = {
+  dragGroup: 'Drag bookmark group {name}',
+  dragToReorder: 'Drag to reorder',
+  dragGroupPinnedOnly: 'Reorder groups on the Groups or Pinned page',
+  dragGroupCannotMoveToFolder: 'Bookmark groups cannot be moved into bookmark folders',
+  dragFolderCannotReorderBookmarks: 'A folder cannot be inserted into the bookmark order',
+  dragSwitchToNativeOrder: 'Switch to Browser order before dragging to reorder',
+  dragBookmarkPositionUnchanged: 'Bookmark position did not change',
+  dragSameFolderOnly: 'Bookmarks can only be reordered within the same folder. Drop on a folder to move them.',
+  dragPinnedGroupsCannotCross: 'Pinned and unpinned bookmarks are shown in separate groups and cannot be reordered across groups.',
+  dragMoveBefore: 'Move “{item}” before “{target}”',
+  dragMoveAfter: 'Move “{item}” after “{target}”',
+  dragMovedBefore: 'Moved “{item}” before “{target}”',
+  dragMovedAfter: 'Moved “{item}” after “{target}”',
+  dragAllIsNotFolder: 'All is not a destination folder',
+  dragTargetFolderMissing: 'The destination folder no longer exists',
+  dragAlreadyInFolder: '“{item}” is already in “{target}”',
+  dragMoveToFolder: 'Move “{item}” to “{target}”',
+  dragMovedToFolder: 'Moved “{item}” to “{target}”',
+  dragFolderCannotMove: 'This folder cannot be moved',
+  dragCannotMoveIntoSelf: 'A folder cannot be moved into itself',
+  dragCannotMoveParentIntoChild: 'A parent folder cannot be moved into one of its subfolders',
+  dragMoveFailed: 'Could not move the item. Try again later.',
+  dragScreenReaderInstructions: 'Press Space to start dragging. Use the arrow keys to choose a bookmark position or folder, then press Space to drop. Press Escape to cancel.',
+  dragStartedNamed: 'Started dragging {name}',
+  dragStarted: 'Started dragging',
+  dragNoDropPosition: 'There is no available drop position',
+  dragEndedWithoutMove: 'Drag ended without moving anything',
+  dragCancelledNamed: 'Cancelled dragging {name}',
+  dragCancelled: 'Cancelled dragging',
+}
+
+export const dragDropMessages: Record<Language, DragDropMessages> = {
+  'zh-TW': zhTW,
+  en,
+}

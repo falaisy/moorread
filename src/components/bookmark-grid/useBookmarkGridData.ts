@@ -1,0 +1,81 @@
+import type {
+  Bookmark,
+  BookmarkSortMode,
+  BookmarkUsage,
+  Category,
+} from '~/lib/types'
+import { useMemo } from 'react'
+import {
+  filterGridBookmarks,
+  filterGridCategories,
+  isSmartBookmarkView,
+  selectBookmarksForView,
+} from '~/lib/bookmark-grid-data'
+import { getNavigationDerivedData } from '~/lib/navigation-derived'
+
+interface BookmarkGridDataOptions {
+  bookmarks: Bookmark[]
+  categories: Category[]
+  activeCategoryId: string
+  searchQuery: string
+  sortMode: BookmarkSortMode
+  usage: Record<string, BookmarkUsage>
+}
+
+export function useBookmarkGridData({
+  bookmarks,
+  categories,
+  activeCategoryId,
+  searchQuery,
+  sortMode,
+  usage,
+}: BookmarkGridDataOptions) {
+  const derived = useMemo(
+    () => getNavigationDerivedData(bookmarks, categories),
+    [bookmarks, categories],
+  )
+  const categorizedBookmarks = useMemo(
+    () =>
+      selectBookmarksForView(
+        bookmarks,
+        activeCategoryId,
+        sortMode,
+        usage,
+      ),
+    [activeCategoryId, bookmarks, sortMode, usage],
+  )
+  const searchResults = useMemo(
+    () =>
+      searchQuery.trim()
+        ? filterGridBookmarks(
+            [],
+            derived.searchEntries,
+            searchQuery,
+          )
+        : undefined,
+    [derived, searchQuery],
+  )
+  const filteredCategories = useMemo(
+    () =>
+      filterGridCategories(
+        categories,
+        activeCategoryId,
+        derived.categoryPathMap,
+        searchQuery,
+      ),
+    [activeCategoryId, categories, derived.categoryPathMap, searchQuery],
+  )
+
+  return {
+    categoryPathMap: derived.categoryPathMap,
+    filteredBookmarks: searchResults ?? categorizedBookmarks,
+    filteredCategories,
+    isSmartView: isSmartBookmarkView(activeCategoryId),
+    itemCounts: {
+      bookmarkCountByCategory: derived.bookmarkCountByCategory,
+      childCountByCategory: derived.childCategoryCountByCategory,
+      previewBookmarksByCategory: derived.previewBookmarksByCategory,
+    },
+    searching: Boolean(searchQuery.trim()),
+  }
+}

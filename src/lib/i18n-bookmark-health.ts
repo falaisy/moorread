@@ -1,0 +1,71 @@
+import type { Language } from './types'
+
+export type BookmarkHealthMessageKey = keyof typeof zhTW
+type BookmarkHealthMessages = Record<BookmarkHealthMessageKey, string>
+
+const zhTW = {
+  healthIssueDuplicate: '重複',
+  healthIssueRedirected: '已重新導向',
+  healthIssueHttpError: 'HTTP 錯誤',
+  healthIssueUnreachable: '無法存取',
+  healthAllIssues: '全部問題',
+  healthRedirectedFilter: '重新導向',
+  healthDescription: '手動檢查重複、失效和重新導向的連結；忽略的網域不會被存取。',
+  healthCheckingProgress: '正在檢查 {completed}/{total}',
+  healthCheckAgain: '重新檢查',
+  healthCheckBookmarkCount: '檢查 {count} 個書籤',
+  healthFoundBookmarkCount: '發現 {count} 個需要處理的書籤',
+  healthNoIssues: '沒有發現書籤問題',
+  healthKeepThis: '保留此項',
+  healthUpdateAddress: '更新網址',
+  healthMergeTitle: '合併重複書籤？',
+  healthDeleteTitle: '刪除此書籤？',
+  healthMergeDescription: '將保留目前項目並刪除其他相同 URL 的瀏覽器書籤。刪除項目會移到垃圾桶並保留 30 天，也可在頁面底部立即復原。',
+  healthDeleteDescription: '瀏覽器書籤也會一併刪除。刪除項目會移到垃圾桶並保留 30 天，也可在頁面底部立即復原。',
+  healthConfirmMerge: '確認合併',
+  healthSitePermissionRequired: '需要授權存取網站後才能檢查連結',
+  healthScanFailed: '檢查失敗，請確認網路連線後再試一次',
+  healthUpdateRedirectFailed: '無法更新重新導向網址',
+  healthMergeFailed: '無法合併重複書籤',
+  healthDeleteFailed: '無法刪除書籤',
+  healthTaskLabel: '書籤健康檢查',
+  healthTaskPermissionDenied: '未授予網站存取權限',
+  healthTaskFoundIssues: '發現 {count} 個有問題的連結',
+  healthTaskFailed: '書籤健康檢查失敗',
+}
+
+const en: BookmarkHealthMessages = {
+  healthIssueDuplicate: 'Duplicate',
+  healthIssueRedirected: 'Redirected',
+  healthIssueHttpError: 'HTTP error',
+  healthIssueUnreachable: 'Unreachable',
+  healthAllIssues: 'All issues',
+  healthRedirectedFilter: 'Redirected',
+  healthDescription: 'Check for duplicate, broken, and redirected links. Ignored domains will not be accessed.',
+  healthCheckingProgress: 'Checking {completed}/{total}',
+  healthCheckAgain: 'Check again',
+  healthCheckBookmarkCount: 'Check {count} bookmarks',
+  healthFoundBookmarkCount: '{count} bookmarks need attention',
+  healthNoIssues: 'No bookmark issues found',
+  healthKeepThis: 'Keep this one',
+  healthUpdateAddress: 'Update address',
+  healthMergeTitle: 'Merge duplicate bookmarks?',
+  healthDeleteTitle: 'Delete this bookmark?',
+  healthMergeDescription: 'The current bookmark will be kept and other browser bookmarks with the same URL will be deleted. Deleted items remain in Trash for 30 days and can be undone immediately at the bottom of the page.',
+  healthDeleteDescription: 'The browser bookmark will also be deleted. Deleted items remain in Trash for 30 days and can be undone immediately at the bottom of the page.',
+  healthConfirmMerge: 'Merge',
+  healthSitePermissionRequired: 'Allow site access before checking links.',
+  healthScanFailed: 'The check failed. Confirm your network connection and try again.',
+  healthUpdateRedirectFailed: 'Could not update the redirected address.',
+  healthMergeFailed: 'Could not merge the duplicate bookmarks.',
+  healthDeleteFailed: 'Could not delete the bookmark.',
+  healthTaskLabel: 'Bookmark health check',
+  healthTaskPermissionDenied: 'Site access was not granted',
+  healthTaskFoundIssues: 'Found {count} problematic links',
+  healthTaskFailed: 'Bookmark health check failed',
+}
+
+export const bookmarkHealthMessages: Record<Language, BookmarkHealthMessages> = {
+  'zh-TW': zhTW,
+  en,
+}

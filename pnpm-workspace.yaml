@@ -1,0 +1,7 @@
+packages:
+  - .
+
+minimumReleaseAge: 10080
+trustPolicy: no-downgrade
+trustPolicyExclude:
+  - '@swc/core@1.6.13'

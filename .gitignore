@@ -1,0 +1,26 @@
+node_modules/
+.pnpm-store/
+build/
+.plasmo/
+.parcel-cache/
+test-results/
+playwright-report/
+.playwright-artifacts/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
+
+# E2E 專用暫存 profile（測試執行時建立，不納入版控）
+test-temp/
+
+# Spike 測試產物（含自簽私鑰，不得入庫）
+spike-t18/
+
+# 憑證與私鑰一律不入庫（避免改名或搬移後誤入）
+*.pem
+*.key
+*.p12
+*.pfx

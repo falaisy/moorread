@@ -1,0 +1,126 @@
+import type { HeaderWidgetSettings, WeatherLocation } from './types'
+
+export const WEATHER_ORIGINS = ['https://api.open-meteo.com/*', 'https://geocoding-api.open-meteo.com/*']
+export const WEATHER_CACHE_TTL_MS = 15 * 60_000
+export const DEFAULT_HEADER_WIDGET: HeaderWidgetSettings = {
+  clockEnabled: true,
+  weatherEnabled: true,
+  showDate: true,
+  hour12: false,
+  temperatureUnit: 'celsius',
+  location: null,
+  weatherBackground: true,
+}
+
+export function normalizeHeaderWidget(value?: Partial<HeaderWidgetSettings>): HeaderWidgetSettings {
+  const location = value?.location
+  return {
+    clockEnabled: value?.clockEnabled !== false,
+    weatherEnabled: value?.weatherEnabled !== false,
+    showDate: value?.showDate !== false,
+    hour12: value?.hour12 === true,
+    temperatureUnit: value?.temperatureUnit === 'fahrenheit' ? 'fahrenheit' : 'celsius',
+    location: location && typeof location.name === 'string' && location.name.trim()
+      && Number.isFinite(location.latitude) && Math.abs(location.latitude) <= 90
+      && Number.isFinite(location.longitude) && Math.abs(location.longitude) <= 180
+      ? { name: location.name.trim().slice(0, 100), latitude: location.latitude, longitude: location.longitude }
+      : null,
+    weatherBackground: value?.weatherBackground !== false,
+  }
+}
+
+async function fetchJson(url: string, signal?: AbortSignal) {
+  const response = await fetch(url, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(12000)]) : AbortSignal.timeout(12000) })
+  if (!response.ok)
+    throw new Error('weather_request_failed')
+  return response.json()
+}
+
+const CITY_RESULT_LIMIT = 6
+// GeoNames feature codes: capitals and administrative seats first, then ordinary places.
+const placeRank: Record<string, number> = { PPLC: 0, PPLA: 1, PPLA2: 2, PPLA3: 3, PPLA4: 4 }
+
+export async function searchWeatherCities(query: string, language: string): Promise<WeatherLocation[]> {
+  // Ask for more than we show: small villages sharing a big city's name are ranked below it.
+  const params = new URLSearchParams({ name: query.trim(), count: '20', language: language.startsWith('zh') ? 'zh' : language, format: 'json' })
+  const data = await fetchJson(`https://geocoding-api.open-meteo.com/v1/search?${params}`)
+  const items: Record<string, unknown>[] = Array.isArray(data.results) ? data.results : []
+  const places = items.filter(item => typeof item.feature_code !== 'string' || item.feature_code.startsWith('PPL'))
+  const ranked = places
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      const rank = (item: Record<string, unknown>) => placeRank[String(item.feature_code)] ?? 5
+      const population = (item: Record<string, unknown>) => Number(item.population) || 0
+      return rank(left.item) - rank(right.item) || population(right.item) - population(left.item) || left.index - right.index
+    })
+  const seen = new Set<string>()
+  const candidates = ranked.flatMap(({ item }) => {
+    // Name the prefecture or county too, so same-named places in one province stay distinguishable.
+    const parts = [item.name, item.admin2, item.admin1, item.country].filter((part, index, all): part is string =>
+      typeof part === 'string' && Boolean(part.trim()) && all.indexOf(part) === index)
+    const location = normalizeHeaderWidget({ location: {
+      name: parts.join(' · '),
+      latitude: item.latitude as number,
+      longitude: item.longitude as number,
+    } }).location
+    if (!location || seen.has(location.name))
+      return []
+    seen.add(location.name)
+    const feature = String(item.feature_code)
+    const population = Number(item.population)
+    const isAdministrativeCity = /^PPLA[2-5]?$/.test(feature) || feature === 'PPLC' || feature === 'PPLCD'
+    const isCity = isAdministrativeCity || (feature === 'PPL' && Number.isFinite(population) && population > 0)
+    return [{ location, isCity, isAdministrativeCity }]
+  })
+  const cities = candidates.filter(candidate => candidate.isCity)
+  const hasAdministrativeCity = candidates.some(candidate => candidate.isAdministrativeCity)
+  return (hasAdministrativeCity ? cities : candidates).slice(0, CITY_RESULT_LIMIT).map(candidate => candidate.location)
+}
+
+export interface WeatherReading {
+  temperature: number
+  code: number
+  isDay: boolean
+  fetchedAt: number
+}
+
+export async function loadWeather(location: WeatherLocation, unit: HeaderWidgetSettings['temperatureUnit'], signal: AbortSignal): Promise<WeatherReading> {
+  const key = `yunji-weather:${location.latitude}:${location.longitude}:${unit}`
+  const cached = (await chrome.storage.local.get(key))[key] as WeatherReading | undefined
+  if (cached && Number.isFinite(cached.temperature) && Number.isFinite(cached.code)
+    && Date.now() - cached.fetchedAt >= 0 && Date.now() - cached.fetchedAt < WEATHER_CACHE_TTL_MS) {
+    return cached
+  }
+  if (!await chrome.permissions.contains({ origins: WEATHER_ORIGINS }))
+    throw new Error('weather_permission_required')
+  const params = new URLSearchParams({ latitude: String(location.latitude), longitude: String(location.longitude), current: 'temperature_2m,weather_code,is_day', temperature_unit: unit })
+  const data = await fetchJson(`https://api.open-meteo.com/v1/forecast?${params}`, signal)
+  if (!Number.isFinite(data.current?.temperature_2m) || !Number.isFinite(data.current?.weather_code))
+    throw new Error('weather_invalid_response')
+  const reading = { temperature: data.current.temperature_2m, code: data.current.weather_code, isDay: data.current.is_day === 1, fetchedAt: Date.now() }
+  await chrome.storage.local.set({ [key]: reading })
+  return reading
+}
+
+export function weatherKind(code: number) {
+  if (code === 0)
+    return 'clear'
+  if (code <= 3)
+    return 'cloudy'
+  if (code === 45 || code === 48)
+    return 'fog'
+  if ((code >= 71 && code <= 77) || code === 85 || code === 86)
+    return 'snow'
+  if (code >= 95)
+    return 'storm'
+  return 'rain'
+}
+
+export type WeatherScene = 'clear-day' | 'clear-night' | 'cloudy' | 'fog' | 'rain' | 'snow' | 'storm'
+
+export function weatherScene(reading: Pick<WeatherReading, 'code' | 'isDay'>): WeatherScene {
+  const kind = weatherKind(reading.code)
+  if (kind === 'clear')
+    return reading.isDay ? 'clear-day' : 'clear-night'
+  return kind
+}

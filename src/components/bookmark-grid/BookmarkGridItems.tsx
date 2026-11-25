@@ -1,0 +1,149 @@
+import type { ReactNode } from 'react'
+import type { GridItemCounts } from '~/lib/bookmark-grid-data'
+import type { EntranceDirection } from '~/lib/motion'
+import type {
+  AppearanceSettings,
+  Bookmark,
+  BookmarkViewMode,
+  Category,
+} from '~/lib/types'
+import { useRef } from 'react'
+import { BookmarkCard } from '~/components/BookmarkCard'
+import { CategoryCard } from '~/components/CategoryCard'
+import { gridClass } from '~/lib/appearance'
+import { useBookmarkGroupsStore } from '~/lib/bookmark-groups-store'
+import { bookmarkCardKey, comparePinnedCards, getPinnedCards } from '~/lib/card-order'
+import { useStaggeredEntrance } from '~/lib/motion'
+import { useNavStore } from '~/lib/store'
+
+export interface AdditionalGridItem {
+  key: string
+  pinnedAt: number
+  pinnedOrder?: number
+  node: ReactNode
+}
+
+interface BookmarkGridItemsProps {
+  additionalItems?: AdditionalGridItem[]
+  /** Cards replay their entrance whenever this changes, e.g. on switching category or view. */
+  entranceKey: string
+  entranceDirection?: EntranceDirection
+  appearance: AppearanceSettings
+  bookmarks: Bookmark[]
+  categories: Category[]
+  categoryPathMap: Map<string, string[]>
+  itemCounts: GridItemCounts
+  onEdit: (bookmark: Bookmark) => void
+  onEditCategory: (category: Category) => void
+  onToggleSelection: (bookmarkId: string) => void
+  reorderEnabled: boolean
+  pinnedReorder: boolean
+  searching: boolean
+  selectedIds: Set<string>
+  selectionMode: boolean
+  viewMode: BookmarkViewMode
+}
+
+export function BookmarkGridItems({
+  additionalItems,
+  entranceKey,
+  entranceDirection,
+  appearance,
+  bookmarks,
+  categories,
+  categoryPathMap,
+  itemCounts,
+  onEdit,
+  onEditCategory,
+  onToggleSelection,
+  reorderEnabled,
+  pinnedReorder,
+  searching,
+  selectedIds,
+  selectionMode,
+  viewMode,
+}: BookmarkGridItemsProps) {
+  const setActiveCategory = useNavStore(state => state.setActiveCategory)
+  const setSearchQuery = useNavStore(state => state.setBookmarkSearchQuery)
+  const openCategory = (categoryId: string) => {
+    setActiveCategory(categoryId)
+    setSearchQuery('')
+  }
+  const allBookmarks = useNavStore(state => state.bookmarks)
+  const groups = useBookmarkGroupsStore(state => state.groups)
+  const folderGridRef = useRef<HTMLDivElement>(null)
+  const gridRef = useRef<HTMLDivElement>(null)
+  useStaggeredEntrance(folderGridRef, entranceKey, entranceDirection)
+  useStaggeredEntrance(gridRef, entranceKey, entranceDirection)
+  const pinnedIndices = new Map(getPinnedCards(allBookmarks, groups).map((card, index) => [card.key, index]))
+  const items: Array<AdditionalGridItem & { bookmark?: Bookmark, renderKey: string }> = [
+    ...bookmarks.map(bookmark => ({
+      key: bookmarkCardKey(bookmark.url),
+      renderKey: bookmark.id,
+      pinnedAt: bookmark.pinnedAt ?? 0,
+      pinnedOrder: bookmark.pinnedOrder,
+      bookmark,
+      node: null,
+    })),
+    ...(additionalItems ?? []).map(item => ({ ...item, renderKey: item.key })),
+  ]
+  if (pinnedReorder && !searching)
+    items.sort(comparePinnedCards)
+
+  return (
+    <>
+      {categories.length > 0
+        ? (
+            <div
+              ref={folderGridRef}
+              className={`mb-4 ${gridClass(appearance.folderGridCols, viewMode === 'compact')}`}
+            >
+              {categories.map(category => (
+                <CategoryCard
+                  key={category.id}
+                  category={category}
+                  bookmarkCount={
+                    itemCounts.bookmarkCountByCategory.get(category.id) ?? 0
+                  }
+                  childCategoryCount={
+                    itemCounts.childCountByCategory.get(category.id) ?? 0
+                  }
+                  previewBookmarks={itemCounts.previewBookmarksByCategory.get(category.id)}
+                  onEdit={onEditCategory}
+                  compact={viewMode === 'compact'}
+                  locationLabel={
+                    searching
+                      ? categoryPathMap.get(category.id)?.slice(0, -1).join(' / ')
+                      : undefined
+                  }
+                  onOpen={searching ? selected => openCategory(selected.id) : undefined}
+                  appearance={appearance}
+                />
+              ))}
+            </div>
+          )
+        : null}
+      <div ref={gridRef} className={gridClass(appearance.bookmarkGridCols, viewMode === 'compact')}>
+        {items.map(item => item.bookmark
+          ? (
+              <BookmarkCard
+                key={item.renderKey}
+                bookmark={item.bookmark}
+                onEdit={onEdit}
+                categoryPath={searching ? categoryPathMap.get(item.bookmark.categoryId)?.join(' / ') : undefined}
+                onOpenCategory={searching ? () => openCategory(item.bookmark!.categoryId) : undefined}
+                selectionMode={selectionMode}
+                selected={selectedIds.has(item.bookmark.id)}
+                onToggleSelection={() => onToggleSelection(item.bookmark!.id)}
+                compact={viewMode === 'compact'}
+                appearance={appearance}
+                reorderEnabled={reorderEnabled}
+                reorderIndex={pinnedReorder ? pinnedIndices.get(item.key) : undefined}
+                pinnedReorder={pinnedReorder}
+              />
+            )
+          : item.node)}
+      </div>
+    </>
+  )
+}

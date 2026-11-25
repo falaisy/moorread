@@ -1,0 +1,222 @@
+import type { AdditionalGridItem } from '~/components/bookmark-grid/BookmarkGridItems'
+import type { EntranceDirection } from '~/lib/motion'
+import type { Bookmark, Category } from '~/lib/types'
+import { useDeferredValue, useMemo, useState } from 'react'
+import { BookmarkGridEmptyState } from '~/components/bookmark-grid/BookmarkGridEmptyState'
+import { BookmarkGridItems } from '~/components/bookmark-grid/BookmarkGridItems'
+import { BookmarkGridLoadingState } from '~/components/bookmark-grid/BookmarkGridLoadingState'
+import { BookmarkGridToolbar } from '~/components/bookmark-grid/BookmarkGridToolbar'
+import { useBookmarkBulkActions } from '~/components/bookmark-grid/useBookmarkBulkActions'
+import { useBookmarkGridData } from '~/components/bookmark-grid/useBookmarkGridData'
+import { BulkActionBar } from '~/components/BulkActionBar'
+import { Button } from '~/components/ui/button'
+import { useBookmarks, useCategories, useNavStore } from '~/lib/store'
+import { useI18n } from '~/lib/use-i18n'
+
+interface BookmarkGridProps {
+  loading: boolean
+  additionalItems?: AdditionalGridItem[]
+  additionalItemCount?: number
+  onEdit: (bookmark: Bookmark) => void
+  onEditCategory: (category: Category) => void
+  onAdd: () => void
+}
+
+const RENDER_BATCH_SIZE = 50
+
+/** True when `descendantId` sits somewhere inside `ancestorId`; every folder lives inside "all". */
+function isInside(descendantId: string, ancestorId: string, categories: Category[]): boolean {
+  const parents = new Map(categories.map(category => [category.id, category.parentId]))
+  if (!parents.has(descendantId))
+    return false
+  if (ancestorId === 'all')
+    return true
+  for (let id = parents.get(descendantId); id !== undefined; id = parents.get(id)) {
+    if (id === ancestorId)
+      return true
+  }
+  return false
+}
+
+function entranceDirection(from: string, to: string, categories: Category[]): EntranceDirection {
+  if (isInside(to, from, categories))
+    return 'forward'
+  if (isInside(from, to, categories))
+    return 'back'
+  return 'up'
+}
+
+export function BookmarkGrid({
+  loading,
+  additionalItems,
+  additionalItemCount = 0,
+  onEdit,
+  onEditCategory,
+  onAdd,
+}: BookmarkGridProps) {
+  const { t } = useI18n()
+  const bookmarks = useBookmarks()
+  const categories = useCategories()
+  const activeCategoryId = useNavStore(state => state.activeCategoryId)
+  const rawSearchQuery = useNavStore(state => state.bookmarkSearchQuery)
+  const searchQuery = useDeferredValue(rawSearchQuery)
+  const usage = useNavStore(state => state.usage)
+  const sortMode = useNavStore(state => state.settings.bookmarkSortMode)
+  const viewMode = useNavStore(state => state.settings.bookmarkViewMode)
+  const appearance = useNavStore(state => state.settings.appearance)
+  // Opening a folder brings its cards in from the right; going back up brings the parent's in from the left.
+  const [entrance, setEntrance] = useState({ categoryId: activeCategoryId, direction: 'up' as EntranceDirection })
+  if (entrance.categoryId !== activeCategoryId)
+    setEntrance({ categoryId: activeCategoryId, direction: entranceDirection(entrance.categoryId, activeCategoryId, categories) })
+  const paginationKey = `${activeCategoryId}\u0000${searchQuery}\u0000${viewMode}`
+  const [pagination, setPagination] = useState({
+    key: paginationKey,
+    limit: RENDER_BATCH_SIZE,
+  })
+  const data = useBookmarkGridData({
+    activeCategoryId,
+    bookmarks,
+    categories,
+    searchQuery,
+    sortMode,
+    usage,
+  })
+  const visibleBookmarkIds = useMemo(
+    () => data.filteredBookmarks.map(bookmark => bookmark.id),
+    [data.filteredBookmarks],
+  )
+  const bulk = useBookmarkBulkActions({
+    activeCategoryId,
+    bookmarks,
+    categories,
+    visibleBookmarkIds,
+  })
+  const visibleLimit
+    = pagination.key === paginationKey ? pagination.limit : RENDER_BATCH_SIZE
+  const renderedBookmarks = data.filteredBookmarks.slice(0, visibleLimit)
+  const visibleCategories
+    = !bulk.selectionMode && appearance.cardFields.categoryCards
+      ? data.filteredCategories
+      : []
+  const pinnedReorder = activeCategoryId === 'pinned'
+  const reorderEnabled
+    = !data.searching
+      && !bulk.selectionMode
+      && (pinnedReorder
+        || (sortMode === 'manual'
+          && categories.some(category => category.id === activeCategoryId)))
+  // SearchBar waits for the deferred query committed with this grid before opening a result.
+  const searchState = <span hidden data-bookmark-search-query={searchQuery} />
+
+  if (loading) {
+    return (
+      <>
+        {searchState}
+        <BookmarkGridLoadingState label={`${t('bookmarks')}…`} />
+      </>
+    )
+  }
+
+  if (bookmarks.length === 0 && categories.length === 0 && additionalItemCount === 0) {
+    return (
+      <>
+        {searchState}
+        <BookmarkGridEmptyState emptyLibrary onAdd={onAdd} />
+      </>
+    )
+  }
+
+  if (
+    visibleCategories.length === 0
+    && data.filteredBookmarks.length === 0
+    && additionalItemCount === 0
+    && !bulk.selectionMode
+    && activeCategoryId !== 'inbox'
+  ) {
+    return (
+      <>
+        {searchState}
+        <BookmarkGridEmptyState
+          searching={Boolean(rawSearchQuery.trim())}
+          isSmartView={data.isSmartView}
+        />
+      </>
+    )
+  }
+
+  return (
+    <>
+      {searchState}
+      <BookmarkGridToolbar
+        activeCategoryId={activeCategoryId}
+        searchQuery={searchQuery}
+        searching={data.searching}
+        selectionMode={bulk.selectionMode}
+        visibleBookmarkCount={visibleBookmarkIds.length}
+        visibleCategoryCount={visibleCategories.length}
+        additionalItemCount={additionalItemCount}
+        onStartSelection={bulk.startSelection}
+      />
+      {bulk.selectionMode
+        ? (
+            <BulkActionBar
+              selectedCount={bulk.selectedCount}
+              visibleCount={visibleBookmarkIds.length}
+              allVisibleSelected={bulk.allVisibleSelected}
+              categories={categories}
+              destinationId={bulk.destinationId}
+              busy={bulk.busy}
+              message={bulk.message}
+              onCancel={bulk.cancelSelection}
+              onToggleAll={bulk.toggleAll}
+              onDestinationChange={bulk.setDestinationId}
+              onMove={() => void bulk.move()}
+              onOpen={() => void bulk.open()}
+              onSync={() => void bulk.sync()}
+              onDelete={() => void bulk.remove()}
+              onOrganize={bulk.organize ? () => void bulk.organize?.() : undefined}
+            />
+          )
+        : null}
+      <BookmarkGridItems
+        entranceKey={`${activeCategoryId}\u0000${viewMode}`}
+        entranceDirection={entrance.direction}
+        appearance={appearance}
+        bookmarks={renderedBookmarks}
+        categories={visibleCategories}
+        categoryPathMap={data.categoryPathMap}
+        itemCounts={data.itemCounts}
+        onEdit={onEdit}
+        onEditCategory={onEditCategory}
+        onToggleSelection={bulk.toggleBookmark}
+        reorderEnabled={reorderEnabled}
+        pinnedReorder={pinnedReorder}
+        searching={data.searching}
+        selectedIds={bulk.selectedIds}
+        selectionMode={bulk.selectionMode}
+        viewMode={viewMode}
+        additionalItems={bulk.selectionMode ? undefined : additionalItems}
+      />
+      {renderedBookmarks.length < data.filteredBookmarks.length
+        ? (
+            <div className="mt-5 flex justify-center">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setPagination({
+                    key: paginationKey,
+                    limit: visibleLimit + RENDER_BATCH_SIZE,
+                  })}
+              >
+                {t('loadMoreRemaining', {
+                  count: data.filteredBookmarks.length - renderedBookmarks.length,
+                })}
+              </Button>
+            </div>
+          )
+        : null}
+    </>
+  )
+}
