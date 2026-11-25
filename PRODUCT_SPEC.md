@@ -1,6 +1,6 @@
 # PRODUCT_SPEC.md — MoorRead（書野）產品規格
 
-> 建立：2026-11-08。來源：`README.md`、`docs/zh-TW/*`、`內部文件`、現有程式碼。
+> 建立：2026-11-08。來源：`README.md`、`README.en.md`、`ARCHITECTURE.md`、`docs/zh-TW/*`、`docs/en/*`、現有程式碼。
 > 標記規則：`[已實作]` 有程式證據；`[未驗證]` 尚無真實使用證據；`[未實作]` 明確缺功能。
 
 ## 1. 產品定位
@@ -11,7 +11,7 @@ Chrome 擴充功能（Manifest V3），把瀏覽器原生書籤變成可搜尋�
 - 品牌：書野 MoorRead（moor + read）。
 - 來源：MIT fork 自 `kiwiflydream/yunji-tab`，原作 © KIWI；修改 © 2026 falaisy。
 - 發行：Chrome Web Store 不公開（Unlisted），主要自用；商店連結 `https://chromewebstore.google.com/detail/eljjakdncoiphlbipgildicliklhmccl`。
-- 主 repo：`falaisy/moorread-clean`（private）；隱私政策 repo：`falaisy/moorread-privacy`（public）。
+- 主 repo：`falaisy/moorread`（private）；隱私政策 repo：`falaisy/moorread-privacy`（public）。
 
 ## 2. 目標使用者與使用情境
 
