@@ -4,7 +4,7 @@ import { expect, test } from './extension.fixture'
 
 const settingsKey = 'moorread:settings'
 
-// 只提供 0.1.5／0.1.6 真的有的 settings 欄位；nativeBookmarkSort／gistBackup 不應被備份覆蓋。
+// 只提供 0.1.5／0.1.6 真的有的 settings 欄位；gistBackup 不應被備份覆蓋。
 const legacyRaw = JSON.stringify({
   kind: 'yunji-tab-full-bookmark-snapshot',
   schemaVersion: 1,
@@ -49,16 +49,6 @@ const seededSettings = {
   autoOrganizeRules: [],
   autoOrganizeOnSave: true,
   metadataSyncEncryptionEnabled: false,
-  nativeBookmarkSort: {
-    enabled: true,
-    autoSort: true,
-    sortCriteria: [{ field: 'title', direction: 'asc' }],
-    includeSubfolders: false,
-    sortSelf: true,
-    targetMode: 'all',
-    targetFolderIds: [],
-    ignoreFolderIds: [],
-  },
   gistBackup: { token: '', gistId: 'seeded-gist', encrypt: false, passphrase: '' },
 }
 
@@ -79,7 +69,6 @@ function countRestoreFolders(worker: Worker) {
 function readSettings(worker: Worker) {
   return worker.evaluate(async key => JSON.parse(String((await chrome.storage.sync.get(key))[key])) as {
     theme?: string
-    nativeBookmarkSort?: { enabled?: boolean }
     gistBackup?: { gistId?: string }
   }, settingsKey)
 }
@@ -136,7 +125,6 @@ test('restores a legacy 0.1.5/0.1.6 snapshot locally and keeps settings the back
 
     const settings = await readSettings(extensionWorker)
     expect(settings.theme).toBe('dark')
-    expect(settings.nativeBookmarkSort?.enabled).toBe(true)
     expect(settings.gistBackup?.gistId).toBe('seeded-gist')
   }
   finally {

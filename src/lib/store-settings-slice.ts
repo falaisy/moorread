@@ -418,16 +418,6 @@ export const createSettingsSlice: StateCreator<
     await markLocalMetadataChanged()
   },
 
-  setNativeBookmarkSort: async (patch) => {
-    await commitSettings(set, latest => ({
-      ...latest,
-      nativeBookmarkSort: {
-        ...latest.nativeBookmarkSort,
-        ...patch,
-      },
-    }))
-  },
-
   setGistBackup: (patch) => {
     // 樂觀更新：輸入或貼上 Token 後立刻操作時，處理函式必須讀到最新值，
     // 不能等到 storage 寫入完成才反映到畫面。

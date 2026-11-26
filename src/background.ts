@@ -51,7 +51,6 @@ import { translateRuntime } from '~/lib/i18n-runtime'
 import { loadPreferredLanguage } from '~/lib/language'
 import { LocalizedError } from '~/lib/localized-error'
 import { markLocalMetadataChanged } from '~/lib/metadata-sync'
-import { registerNativeSortAutoListener } from '~/lib/native-sort-auto'
 import {
   currentPageFromTab,
   getDuplicateBookmark,
@@ -902,4 +901,3 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 })
 
 registerBookmarkEvents()
-registerNativeSortAutoListener()

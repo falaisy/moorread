@@ -3,7 +3,6 @@ import type { ReactNode } from 'react'
 
 import {
   Bookmark,
-  BookOpenText,
   Bot,
   Database,
   Eye,
@@ -22,7 +21,6 @@ import { SettingsBookmarkTab } from '~/components/settings/SettingsBookmarkTab'
 import { SettingsDataTab } from '~/components/settings/SettingsDataTab'
 import { SettingsGeneralTab } from '~/components/settings/SettingsGeneralTab'
 import { SettingsLayoutTab } from '~/components/settings/SettingsLayoutTab'
-import { SettingsNativeSortTab } from '~/components/settings/SettingsNativeSortTab'
 import { SettingsSearchTab } from '~/components/settings/SettingsSearchTab'
 import { SettingsShortcutsTab } from '~/components/settings/SettingsShortcutsTab'
 import { SettingsSyncTab } from '~/components/settings/SettingsSyncTab'
@@ -38,7 +36,6 @@ export type SettingsTab
     | 'sync'
     | 'ai'
     | 'data'
-    | 'nativeSort'
     | 'about'
 
 type SettingsTabLabelKey
@@ -51,7 +48,6 @@ type SettingsTabLabelKey
     | 'general'
     | 'keyboardShortcuts'
     | 'layoutAppearance'
-    | 'nativeBookmarkSort'
     | 'search'
     | 'visualAppearance'
 
@@ -83,7 +79,6 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
       </>
     ),
   },
-  { id: 'nativeSort', labelKey: 'nativeBookmarkSort', Icon: BookOpenText, render: () => <SettingsNativeSortTab /> },
   { id: 'about', labelKey: 'about', Icon: Info, render: () => <SettingsAboutTab /> },
 ]
 

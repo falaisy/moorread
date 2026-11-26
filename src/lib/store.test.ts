@@ -1126,10 +1126,9 @@ function legacySnapshot(options: {
 describe('restore full backup safety', () => {
   it('keeps current settings that an older backup does not contain', async () => {
     stubRestoreChrome()
-    const currentNativeSort = { ...DEFAULT_SETTINGS.nativeBookmarkSort, enabled: true, autoSort: true }
     const currentGistBackup = { token: 'secret-token', gistId: 'gist-1', encrypt: true, passphrase: 'secret-pass' }
     useNavStore.setState({
-      settings: { ...DEFAULT_SETTINGS, theme: 'light', nativeBookmarkSort: currentNativeSort, gistBackup: currentGistBackup },
+      settings: { ...DEFAULT_SETTINGS, theme: 'light', bookmarkViewMode: 'compact', gistBackup: currentGistBackup },
       meta: { 'https://existing.example': { tags: ['keep'] } },
     })
 
@@ -1141,7 +1140,7 @@ describe('restore full backup safety', () => {
     const settings = useNavStore.getState().settings
     expect(settings.theme).toBe('dark')
     expect(settings.language).toBe('en')
-    expect(settings.nativeBookmarkSort).toEqual(currentNativeSort)
+    expect(settings.bookmarkViewMode).toBe('compact')
     expect(settings.gistBackup).toEqual(currentGistBackup)
     expect(useNavStore.getState().meta['https://existing.example']).toEqual({ tags: ['keep'] })
   })
@@ -1226,8 +1225,8 @@ describe('restore full backup safety', () => {
         getTree: async () => [{ id: '0', title: '', children: [{ id: '1', title: '書籤列', children: [] }] }],
       },
     })
-    const currentNativeSort = { ...DEFAULT_SETTINGS.nativeBookmarkSort, enabled: true }
-    useNavStore.setState({ settings: { ...DEFAULT_SETTINGS, theme: 'light', nativeBookmarkSort: currentNativeSort } })
+    const currentSavedSearches = [{ id: 'saved-1', name: '保留搜尋', query: 'tag:keep' }]
+    useNavStore.setState({ settings: { ...DEFAULT_SETTINGS, theme: 'light', savedSearches: currentSavedSearches } })
 
     await useNavStore.getState().importBackup(JSON.stringify({
       schemaVersion: 1,
@@ -1239,7 +1238,7 @@ describe('restore full backup safety', () => {
     }), 'merge')
 
     expect(useNavStore.getState().settings.theme).toBe('dark')
-    expect(useNavStore.getState().settings.nativeBookmarkSort).toEqual(currentNativeSort)
+    expect(useNavStore.getState().settings.savedSearches).toEqual(currentSavedSearches)
   })
 
   it('writes nothing when the snapshot fails validation', async () => {

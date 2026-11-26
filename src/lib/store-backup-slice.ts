@@ -279,8 +279,8 @@ function computeMetadataSyncBackoffMs(failureCount: number): number {
 }
 
 /**
- * 只採用備份檔實際提供的 settings 欄位：舊版備份沒有的欄位（例如 nativeBookmarkSort、
- * gistBackup）保持目前設定，不會被 parser 補上的預設值蓋掉。
+ * 只採用備份檔實際提供的 settings 欄位：舊版備份沒有的欄位（例如 gistBackup）
+ * 保持目前設定，不會被 parser 補上的預設值蓋掉。
  *
  * `gistBackup` 例外：備份檔中的憑證一律是淨化後的空字串，整包覆蓋會清空使用者
  * 目前有效的憑證，因此改由 `mergeRestoredGistBackup` 逐欄位合併。

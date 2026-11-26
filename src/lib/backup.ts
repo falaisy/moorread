@@ -9,7 +9,6 @@ import type {
 import { normalizeAppearanceSettings } from './appearance'
 import { normalizeAutoOrganizeRules } from './auto-organize'
 import { parseBookmarkGroup } from './bookmark-groups'
-import { normalizeSortCriteria } from './bookmark-native-sort'
 import { getCategoryPath } from './category-path'
 import { getBrowserLanguage, isLanguage } from './i18n'
 import { normalizeKeyboardShortcuts } from './keyboard-shortcuts'
@@ -315,23 +314,6 @@ export function parseMoorreadBackup(raw: string): MoorreadBackup {
       autoOrganizeRules: normalizeAutoOrganizeRules(settings.autoOrganizeRules),
       autoOrganizeOnSave: settings.autoOrganizeOnSave !== false,
       keyboardShortcuts: normalizeKeyboardShortcuts(settings.keyboardShortcuts),
-      nativeBookmarkSort: (() => {
-        const raw = isRecord(settings.nativeBookmarkSort) ? settings.nativeBookmarkSort : undefined
-        return {
-          enabled: raw?.enabled === true,
-          autoSort: raw?.autoSort === true,
-          sortCriteria: normalizeSortCriteria(raw?.sortCriteria),
-          includeSubfolders: raw?.includeSubfolders === true,
-          sortSelf: raw?.sortSelf !== false,
-          targetMode: raw?.targetMode === 'selected' ? 'selected' : 'all',
-          targetFolderIds: Array.isArray(raw?.targetFolderIds)
-            ? raw.targetFolderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
-            : [],
-          ignoreFolderIds: Array.isArray(raw?.ignoreFolderIds)
-            ? raw.ignoreFolderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
-            : [],
-        }
-      })(),
       gistBackup: (() => {
         const raw = isRecord(settings.gistBackup) ? settings.gistBackup : undefined
         return {

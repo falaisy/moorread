@@ -27,10 +27,12 @@ import { createGroupSlice } from './store-group-slice'
 import { removeLegacyFaviconMeta, setUsagePublisher } from './store-helpers'
 import {
   metaStorage,
+  persist,
   registerSupplementaryPersisted,
   settingsStorage,
   STORAGE_KEYS,
   updateBookmarkMetadata,
+  withSettingsLock,
 } from './store-persistence'
 import { createSettingsSlice } from './store-settings-slice'
 import { DEFAULT_SETTINGS, normalizeSettings } from './store-settings-state'
@@ -155,6 +157,27 @@ export const useNavStore = create<NavState>()((set, get, store) => ({
             () => settingsStorage.get<Settings>(STORAGE_KEYS.settings),
           )
           assertStoredRecord(settingsAfterMigration, 'settings')
+          // 原生書籤排序功能已移除：舊版 storage 可能殘留 nativeBookmarkSort。
+          // 只清掉這一個欄位，其他設定原樣保留；引擎與入口已不存在，不會再被執行。
+          if (
+            settingsAfterMigration
+            && Object.hasOwn(
+              settingsAfterMigration as unknown as Record<string, unknown>,
+              'nativeBookmarkSort',
+            )
+          ) {
+            void withSettingsLock(async () => {
+              const latest = await settingsStorage.get<Record<string, unknown>>(
+                STORAGE_KEYS.settings,
+              )
+              if (!latest || !Object.hasOwn(latest, 'nativeBookmarkSort'))
+                return
+              const rest = Object.fromEntries(
+                Object.entries(latest).filter(([key]) => key !== 'nativeBookmarkSort'),
+              )
+              await persist(settingsStorage, STORAGE_KEYS.settings, rest)
+            }).catch(() => undefined)
+          }
           set({
             meta: normalizedMeta.meta,
             categoryMeta: categoryMeta ?? {},

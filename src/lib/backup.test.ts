@@ -42,7 +42,6 @@ const settings: Settings = {
   autoOrganizeRules: [],
   autoOrganizeOnSave: true,
   keyboardShortcuts: DEFAULT_KEYBOARD_SHORTCUTS,
-  nativeBookmarkSort: { enabled: false, autoSort: false, sortCriteria: [{ field: 'title', direction: 'asc' }], includeSubfolders: false, sortSelf: true, targetMode: 'all', targetFolderIds: [], ignoreFolderIds: [] },
   gistBackup: { token: '', gistId: '', encrypt: false, passphrase: '' },
 }
 
@@ -205,7 +204,6 @@ describe('yunji tab backup', () => {
 
 describe('legacy yunji-tab full snapshot adapter', () => {
   const legacySettings = { ...settings }
-  delete (legacySettings as Partial<Settings>).nativeBookmarkSort
   delete (legacySettings as Partial<Settings>).gistBackup
 
   const legacyRaw = (overrides: Record<string, unknown> = {}) => JSON.stringify({
@@ -230,11 +228,9 @@ describe('legacy yunji-tab full snapshot adapter', () => {
     expect(parsed.legacy).toBe(true)
     expect(parsed.kind).toBe('moorread-full-bookmark-snapshot')
     expect(parsed.roots[0]?.children?.[0]?.url).toBe('https://old.example')
-    expect(parsed.moorread.presentSettings).not.toContain('nativeBookmarkSort')
     expect(parsed.moorread.presentSettings).not.toContain('gistBackup')
     expect(parsed.moorread.presentSettings).toContain('theme')
     // parser 仍會把缺少的欄位補成預設值，但 presentSettings 讓還原層知道不可覆蓋現值。
-    expect(parsed.moorread.settings.nativeBookmarkSort).toBeDefined()
     expect(parsed.moorread.bookmarkGroupsProvided).toBe(false)
   })
 
@@ -286,6 +282,6 @@ describe('legacy yunji-tab full snapshot adapter', () => {
 
     expect(parsed.legacy).toBeUndefined()
     expect(parsed.moorread.bookmarkGroupsProvided).toBe(true)
-    expect(parsed.moorread.presentSettings).toContain('nativeBookmarkSort')
+    expect(parsed.moorread.presentSettings).toContain('gistBackup')
   })
 })

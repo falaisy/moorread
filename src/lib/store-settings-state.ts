@@ -19,10 +19,6 @@ import {
   normalizeAppearanceSettings,
 } from './appearance'
 import { normalizeAutoOrganizeRules } from './auto-organize'
-import {
-  DEFAULT_SORT_CRITERIA,
-  normalizeSortCriteria,
-} from './bookmark-native-sort'
 import { isVirtualCategoryId } from './default-data'
 import { normalizeIgnoredDomains } from './description-sync'
 import { getBrowserLanguage, isLanguage } from './i18n'
@@ -83,9 +79,6 @@ export interface SettingsSlice {
     enabled: boolean,
     passphrase?: string,
   ) => Promise<void>
-  setNativeBookmarkSort: (
-    patch: Partial<Settings['nativeBookmarkSort']>,
-  ) => Promise<void>
   setGistBackup: (
     patch: Partial<Settings['gistBackup']>,
   ) => Promise<void>
@@ -111,15 +104,6 @@ export const DEFAULT_SETTINGS: Settings = {
   autoOrganizeRules: [],
   autoOrganizeOnSave: true,
   keyboardShortcuts: DEFAULT_KEYBOARD_SHORTCUTS,
-  nativeBookmarkSort: {
-    enabled: false,
-    autoSort: false,
-    sortCriteria: [...DEFAULT_SORT_CRITERIA],
-    scope: 'all',
-    sortSelf: true,
-    targetFolderIds: [],
-    ignoreFolderIds: [],
-  },
   gistBackup: {
     token: '',
     gistId: '',
@@ -201,59 +185,6 @@ export function normalizeSettings(settings?: Partial<Settings>): Settings {
     autoOrganizeRules: normalizeAutoOrganizeRules(settings?.autoOrganizeRules),
     autoOrganizeOnSave: settings?.autoOrganizeOnSave !== false,
     keyboardShortcuts: normalizeKeyboardShortcuts(settings?.keyboardShortcuts),
-    nativeBookmarkSort: (() => {
-      const raw = settings?.nativeBookmarkSort
-      // 舊設定 fallback：從 storage 讀到的可能是舊格式（field + direction），
-      // 轉成新格式（sortCriteria）；新格式直接用
-      const rawUnknown = raw as unknown
-      let criteria: unknown = raw?.sortCriteria
-      if (criteria == null && rawUnknown != null && typeof rawUnknown === 'object') {
-        const obj = rawUnknown as Record<string, unknown>
-        const field = obj.field
-        const direction = obj.direction
-        if (typeof field === 'string' && typeof direction === 'string') {
-          criteria = [{ field, direction }]
-        }
-      }
-
-      // scope 遷移：新設直接用，舊設從 targetMode + includeSubfolders 推導
-      let scope: import('./types').NativeSortScope = 'all'
-      if (raw?.scope === 'all' || raw?.scope === 'selected-with-sub' || raw?.scope === 'children-only') {
-        scope = raw.scope
-      }
-      else {
-        const legacyMode = raw?.targetMode === 'selected' ? 'selected' : 'all'
-        const legacySubs = raw?.includeSubfolders === true
-        if (legacyMode === 'all') {
-          scope = 'all'
-        }
-        else if (legacySubs) {
-          // 舊版 selected + 有遞迴 → 用 sortSelf 再細分
-          scope = raw?.sortSelf === false ? 'children-only' : 'selected-with-sub'
-        }
-        else {
-          // 舊版 selected + 無遞迴 → 預設用 selected-with-sub（最接近）
-          scope = 'selected-with-sub'
-        }
-      }
-
-      return {
-        enabled: raw?.enabled === true,
-        autoSort: raw?.autoSort === true,
-        sortCriteria: normalizeSortCriteria(criteria),
-        scope,
-        sortSelf: raw?.sortSelf !== false,
-        targetFolderIds: Array.isArray(raw?.targetFolderIds)
-          ? raw.targetFolderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
-          : [],
-        ignoreFolderIds: Array.isArray(raw?.ignoreFolderIds)
-          ? raw.ignoreFolderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
-          : [],
-        // 保留舊欄位（deprecated），雙寫確保降版不壞
-        ...(raw?.targetMode != null ? { targetMode: raw.targetMode } : {}),
-        ...(raw?.includeSubfolders != null ? { includeSubfolders: raw.includeSubfolders } : {}),
-      }
-    })(),
     gistBackup: (() => {
       const raw = settings?.gistBackup
       return {

@@ -203,36 +203,6 @@ export interface HeaderWidgetSettings {
   weatherBackground: boolean
 }
 
-/** 原生書籤排序範圍：三選一，取代舊的 targetMode + includeSubfolders 兩個 boolean */
-export type NativeSortScope
-  = 'all' // 所有可寫資料夾（Chrome 內建根節點自動跳過）
-    | 'selected-with-sub' // 我選的資料夾 + 它們裡面全部子資料夾
-    | 'children-only' // 只排我選的資料夾裡面的子資料夾（本身不動）
-
-export interface NativeBookmarkSortSettings {
-  /** 是否在设置页显示入口；关闭后不再渲染排序 Tab */
-  enabled: boolean
-  /** 启用后，每次新建或改名书签自动把其所在文件夹重排 */
-  autoSort: boolean
-  /** 多欄位排序鏈；依序 fallback，最後用原始 index 當穩定排序 tiebreaker */
-  sortCriteria: Array<{
-    field: 'title' | 'url' | 'dateAdded' | 'dateLastUsed'
-    direction: 'asc' | 'desc'
-  }>
-  /** 範圍三選一（讀舊版時從 targetMode + includeSubfolders 推導） */
-  scope?: NativeSortScope
-  /** 同時排序目標資料夾本身；false 時只遞迴子資料夾（獨立於 scope） */
-  sortSelf: boolean
-  /** 只排这些文件夹 id（scope !== 'all' 时生效） */
-  targetFolderIds: string[]
-  /** 永遠不排這些資料夾（黑名單，不管什麼 scope 都會排除） */
-  ignoreFolderIds: string[]
-  /** @deprecated 改用 scope；保留是為了舊版升級時不壞 */
-  includeSubfolders?: boolean
-  /** @deprecated 改用 scope；保留是為了舊版升級時不壞 */
-  targetMode?: 'all' | 'selected'
-}
-
 export interface GistBackupSettings {
   /** GitHub personal access token（需有 gist 權限） */
   token: string
@@ -272,8 +242,6 @@ export interface Settings {
   /** 儲存書籤時是否自動套用整理規則（規則不為空時生效） */
   autoOrganizeOnSave: boolean
   keyboardShortcuts: KeyboardShortcuts
-  /** Chrome 原生书签批量排序（功能設計受 Sortmark 啟發） */
-  nativeBookmarkSort: NativeBookmarkSortSettings
   /** GitHub Gist 備份設定 */
   gistBackup: GistBackupSettings
 }

@@ -12,7 +12,6 @@ import { commandPaletteMessages } from './i18n-command-palette'
 import { dragDropMessages } from './i18n-drag-drop'
 import { gistMessages } from './i18n-gist-backup'
 import { keyboardShortcutMessages } from './i18n-keyboard-shortcuts'
-import { nativeSortMessages } from './i18n-native-sort'
 import { runtimeMessages } from './i18n-runtime'
 import { searchEngineMessages } from './i18n-search-engine'
 import { settingsDataMessages } from './i18n-settings-data'
@@ -46,7 +45,6 @@ const zhTW = {
   search: '搜尋',
   contentEnhancement: '內容補全',
   dataAndPrivacy: '資料與隱私',
-  nativeBookmarkSort: '原生書籤',
   about: '關於',
   aboutDescription: '書野 Moorread 是基於 kiwi 的開源專案（MIT）的個人自用版本；程式修改由 AI 協助，本人並非專業開發者。原創 © KIWI。',
   projectRepository: '查看專案原始碼',
@@ -228,7 +226,6 @@ const zhTW = {
   ...bookmarkGroupMessages['zh-TW'],
   ...webdavMessages['zh-TW'],
   ...backupConsentMessages['zh-TW'],
-  ...nativeSortMessages['zh-TW'],
   ...gistMessages['zh-TW'],
   ...chromeSyncMessages['zh-TW'],
 } as const
@@ -254,7 +251,6 @@ const en: Record<keyof typeof zhTW, string> = {
   search: 'Search',
   contentEnhancement: 'Content',
   dataAndPrivacy: 'Data & Privacy',
-  nativeBookmarkSort: 'Bookmarks',
   about: 'About',
   aboutDescription:
     'Moorread is a personal build of kiwi\'s open-source project (MIT). Changes were made with AI assistance; the maintainer is not a professional developer. Original work © KIWI.',
@@ -441,7 +437,6 @@ const en: Record<keyof typeof zhTW, string> = {
   ...bookmarkGroupMessages.en,
   ...webdavMessages.en,
   ...backupConsentMessages.en,
-  ...nativeSortMessages.en,
   ...gistMessages.en,
   ...chromeSyncMessages.en,
 }

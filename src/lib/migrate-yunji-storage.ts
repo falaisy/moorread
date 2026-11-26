@@ -150,14 +150,12 @@ const META_RULES: FieldRules = {
 /**
  * 設定：清單型欄位合併去重；`headerWidget.location` 的 `null` 代表使用者
  * 刻意清空地點（現行寫入路徑確實會寫 `null`），因此保留 `null`。
- * `nativeBookmarkSort.sortCriteria` 是有序排序鏈，順序即語意，不由舊資料補齊。
  */
 const SETTINGS_RULES: FieldRules = {
   descriptionIgnoredDomains: { kind: 'string-set' },
   customSearchEngines: { kind: 'array-by-id' },
   savedSearches: { kind: 'array-by-id' },
   autoOrganizeRules: { kind: 'array-by-id' },
-  nativeBookmarkSort: { fields: { sortCriteria: { kind: 'ordered-array' } } },
   headerWidget: { fields: { location: { kind: 'clearable' } } },
 }
 

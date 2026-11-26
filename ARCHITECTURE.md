@@ -53,8 +53,7 @@ Manifest 來源：`package.json` 的 `manifest` 欄位，由 Plasmo 產生；修
 Chrome bookmarks API
   ├─ src/lib/bookmark-tree.ts / bookmark-repository.ts   讀取與轉換
   ├─ src/lib/category-tree.ts / category-path.ts          分類樹與路徑
-  ├─ src/lib/chrome-bookmark-sync.ts                      Chrome → Moorread 匯入
-  └─ src/lib/bookmark-native-sort.ts                      原生多欄位排序
+  └─ src/lib/chrome-bookmark-sync.ts                      Chrome → Moorread 匯入
 ```
 - 書籤名稱、位置、網址以 Chrome 原生書籤為準；Moorread 不另存副本。
 - 補充資料（描述、標籤、圖示、置頂、收件匣狀態）存 `moorread:meta`（`chrome.storage.local`）。
@@ -77,7 +76,7 @@ SettingsDialog / NewtabWorkspace
 - `chrome.commands.onCommand` → 快速收藏／開命令面板
 - `chrome.runtime.onMessage` → favicon、首頁註冊、命令面板 session（validate／open／save／switch-category／home／close）、快速收藏
 - `chrome.tabs.onRemoved` → 清除 session
-- `registerBookmarkEvents()`、`registerNativeSortAutoListener()`（檔案末端）
+- `registerBookmarkEvents()`（檔案末端）
 
 ### 4.4 同步與備份
 | 機制 | 模組 | 儲存位置 |
@@ -96,7 +95,7 @@ SettingsDialog / NewtabWorkspace
 |---|---|---|
 | 書籤核心 | `bookmark-repository.ts`、`bookmark-tree.ts`、`bookmark-groups.ts` | CRUD、分組、樹狀結構 |
 | 搜尋 | `bookmark-search.ts`、`search-engines.ts` | 模糊搜尋、進階語法、搜尋引擎 |
-| 整理 | `auto-organize.ts`、`native-sort-auto.ts`、`bookmark-native-sort.ts` | 規則整理、原生排序 |
+| 整理 | `auto-organize.ts` | 規則整理 |
 | 健康／安全 | `bookmark-health.ts`、`bookmark-deletion-safety.ts` | 連結檢查、刪除防競態 |
 | 外觀 | `appearance.ts`、`theme-transition.ts`、`main.css` | 主題 token、版面設定 |
 | i18n | `i18n.ts`、`i18n-*.ts`、`language.ts`、`use-i18n.ts` | 翻譯目錄與語系解析（zh-* → zh_TW） |
