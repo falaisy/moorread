@@ -1,0 +1,227 @@
+import type { NativeBookmarkSortSettings } from './types'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+/**
+ * native-sort-auto 測試（D2 / HQ-10）：
+ *  - 佇列競態：enqueue 與 flush 並行時新事件不遺失
+ *  - 失敗保留：非 completed 結果不移除待排項目，且不被快速無限重試
+ *  - 新事件不遺失：flush 期間新增的資料夾會被同一輪處理
+ *  - scope 傳遞（HQ-4）與祖先 manual 繼承（HQ-5）
+ */
+
+const h = vi.hoisted(() => ({
+  session: new Map<string, unknown>(),
+  sync: new Map<string, unknown>(),
+  sortCalls: [] as Array<{ targetIds: string[], scope: string, recurse: boolean }>,
+  sortImpl: null as null | ((targetIds: string[], scope: string) => Promise<{ status: string }>),
+  listeners: {} as Record<string, (arg: string, info: { parentId: string }) => void>,
+}))
+
+vi.mock('./storage-port', () => ({
+  createStoragePort: () => ({
+    get: async (k: string) => h.sync.get(k),
+    set: async (k: string, v: unknown) => {
+      h.sync.set(k, v)
+    },
+    remove: async (k: string) => {
+      h.sync.delete(k)
+    },
+  }),
+}))
+
+vi.mock('./bookmark-native-sort', () => ({
+  normalizeSortCriteria: (c: unknown) => (Array.isArray(c) ? c : []),
+  sortNativeBookmarks: async (opts: { targetFolderIds: string[], scope: string, recurse: boolean }) => {
+    h.sortCalls.push({ targetIds: opts.targetFolderIds, scope: opts.scope, recurse: opts.recurse })
+    return h.sortImpl ? h.sortImpl(opts.targetFolderIds, opts.scope) : { status: 'completed' }
+  },
+}))
+
+const PENDING = 'moorread:auto-sort-pending'
+const SETTINGS_KEY = 'moorread:settings'
+
+interface TreeNode { id: string, children?: TreeNode[] }
+
+function installChrome(tree: TreeNode[] = []) {
+  const g = globalThis as unknown as { chrome: unknown }
+  g.chrome = {
+    storage: {
+      session: {
+        get: async (k: string) => ({ [k]: h.session.get(k) }),
+        set: async (obj: Record<string, unknown>) => {
+          for (const [k, v] of Object.entries(obj)) h.session.set(k, v)
+        },
+      },
+      onChanged: { addListener: () => {} },
+    },
+    bookmarks: {
+      getTree: async () => tree,
+      get: async () => [],
+      onCreated: {
+        addListener: (fn: (id: string, info: { parentId: string }) => void) => {
+          h.listeners.created = fn
+        },
+      },
+      onChanged: { addListener: () => {} },
+      onMoved: { addListener: () => {} },
+      onRemoved: { addListener: () => {} },
+      onChildrenReordered: { addListener: () => {} },
+    },
+  }
+}
+
+function setSettings(patch: Partial<NativeBookmarkSortSettings>) {
+  const base: Partial<NativeBookmarkSortSettings> = {
+    enabled: true,
+    autoSort: true,
+    scope: 'selected-only',
+    sortCriteria: [{ field: 'title', direction: 'asc' }],
+    sortMode: 'criteria',
+    sortSelf: true,
+    targetFolderIds: [],
+    ignoreFolderIds: [],
+    foldersFirst: true,
+  }
+  h.sync.set(SETTINGS_KEY, { nativeBookmarkSort: { ...base, ...patch } })
+}
+
+async function loadModule() {
+  vi.resetModules()
+  return import('./native-sort-auto')
+}
+
+beforeEach(() => {
+  h.session.clear()
+  h.sync.clear()
+  h.sortCalls.length = 0
+  h.sortImpl = null
+  h.listeners = {}
+  vi.useFakeTimers()
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
+describe('d2-3 — 自動排序失敗不可丟棄佇列', () => {
+  it('非 completed 結果 → 保留待排項目，且同輪不無限重試', async () => {
+    installChrome()
+    setSettings({ targetFolderIds: ['f1'] })
+    h.sortImpl = async () => ({ status: 'failed' })
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    // 只嘗試一次（不會無限迴圈）
+    expect(h.sortCalls).toHaveLength(1)
+    // 失敗者保留在佇列，等待下一次事件/啟動
+    expect(h.session.get(PENDING)).toEqual(['f1'])
+  })
+
+  it('completed 結果 → 從佇列移除', async () => {
+    installChrome()
+    setSettings({ targetFolderIds: ['f1'] })
+    h.sortImpl = async () => ({ status: 'completed' })
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(1)
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+
+  it('sort 抛例外（忙碌/API 錯誤）→ 保留佇列，不虛報成功', async () => {
+    installChrome()
+    setSettings({ targetFolderIds: ['f1'] })
+    h.sortImpl = async () => {
+      throw new Error('busy')
+    }
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.session.get(PENDING)).toEqual(['f1'])
+  })
+})
+
+describe('d2-4 — enqueue 與 flush 並行時新事件不遺失', () => {
+  it('flush 等待 f1 期間 enqueue f2 → 同輪仍處理 f2，最終清空', async () => {
+    installChrome([{ id: '0', children: [{ id: 'f1' }, { id: 'f2' }] }])
+    setSettings({ targetFolderIds: ['f1', 'f2'] })
+    let resolveF1: (v: { status: string }) => void = () => {}
+    h.sortImpl = (ids) => {
+      if (ids[0] === 'f1')
+        return new Promise((r) => { resolveF1 = r })
+      return Promise.resolve({ status: 'completed' })
+    }
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    mod.registerNativeSortAutoListener() // 捕捉 onCreated
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(500) // flush 啟動，卡在 f1
+
+    // 並行：使用者新增書籤 → onCreated 觸發 enqueue f2
+    h.listeners.created?.('x', { parentId: 'f2' })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // f1 完成，flush 續跑
+    resolveF1({ status: 'completed' })
+    await vi.advanceTimersByTimeAsync(600)
+
+    // f2 沒有被舊 Set 覆蓋而遺失
+    expect(h.sortCalls.map(c => c.targetIds[0])).toEqual(['f1', 'f2'])
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+})
+
+describe('hQ-4 — 自動排序 scope 傳遞', () => {
+  it('selected-with-sub → 引擎收到相同 scope 且遞迴', async () => {
+    installChrome([{ id: '0', children: [{ id: 'f1' }] }])
+    setSettings({ scope: 'selected-with-sub', targetFolderIds: ['f1'] })
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls[0].scope).toBe('selected-with-sub')
+    expect(h.sortCalls[0].recurse).toBe(true)
+  })
+})
+
+describe('hQ-5 — 祖先 manual 規則繼承與忽略清單', () => {
+  it('祖先資料夾為 manual → 子資料夾跳過，不呼叫排序', async () => {
+    installChrome([{ id: '0', children: [{ id: 'p', children: [{ id: 'f1' }] }] }])
+    setSettings({
+      targetFolderIds: ['f1'],
+      folderRules: [{ folderId: 'p', rule: { mode: 'manual', criteria: [] } }],
+    })
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(0)
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+
+  it('忽略清單中的資料夾 → 跳過並自佇列移除', async () => {
+    installChrome([{ id: '0', children: [{ id: 'f1' }] }])
+    setSettings({ targetFolderIds: ['f1'], ignoreFolderIds: ['f1'] })
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(0)
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+
+  it('全局 manual 模式 → 完全不自動排序', async () => {
+    installChrome([{ id: '0', children: [{ id: 'f1' }] }])
+    setSettings({ sortMode: 'manual', targetFolderIds: ['f1'] })
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(0)
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+})

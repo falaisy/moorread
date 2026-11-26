@@ -12,13 +12,14 @@ import type {
   NativeSortScope,
   PlannerNode,
   RestoreStats,
+  SnapshotData,
 } from './sort-types'
 import {
   chromeBookmarkAdapter,
   chromeStorageAdapter,
   readPlannerTree,
 } from './sort-chrome-adapter'
-import { SortExecutor } from './sort-executor'
+import { SORT_SNAPSHOT_KEY, SortExecutor } from './sort-executor'
 /**
  * 薄型入口與接線層（不是第四個核心模組）。
  *
@@ -252,12 +253,18 @@ function buildDefaultRule(options: NativeBookmarkSortOptions): NativeSortRule {
 /**
  * 批量排序 Chrome 原生書籤（新引擎入口）。
  * 失敗/外部變動/中斷時 status !== 'completed'，呼叫端不可宣稱成功。
+ * 啟動前將原始 Snapshot 獨立保存到 SORT_SNAPSHOT_KEY，與 restore job 互不覆蓋。
  */
 export async function sortNativeBookmarks(
   options: NativeBookmarkSortOptions,
 ): Promise<NativeBookmarkSortResult> {
   if (typeof chrome === 'undefined' || !chrome.bookmarks)
     throw new Error('bookmarks api unavailable')
+
+  // HQ-7：random 模式且未指定 seed → 生成新 seed（每次排序不同，可恢復）
+  if (options.sortMode === 'random' && options.randomSeed === undefined) {
+    options = { ...options, randomSeed: (Date.now() ^ Math.floor(Math.random() * 1e9)) >>> 0 }
+  }
 
   const tree = await readPlannerTree()
   const defaultRule = buildDefaultRule(options)
@@ -276,6 +283,17 @@ export async function sortNativeBookmarks(
   const scopeFolderIds = plan.folders.map(f => f.folderId)
   const snapshot = captureSnapshot(tree, scopeFolderIds)
 
+  // 缺陷 6：將最初排序前的 Snapshot 獨立保存，restore 不覆蓋此鍵。
+  // restore 成功或使用者明確放棄後才清除（由 discardJob 負責）。
+  if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+    try {
+      await chrome.storage.local.set({ [SORT_SNAPSHOT_KEY]: snapshot })
+    }
+    catch {
+      // 寫入失敗不阻止排序啟動：executor.createJob preflight 已配額檢查
+    }
+  }
+
   const result = await nativeSortExecutor.runSort(targets, snapshot)
   return mapResult(result)
 }
@@ -284,13 +302,43 @@ export async function sortNativeBookmarks(
  * 依最近一次工作的快照執行安全復原（獨立 restore job，有自己的快照與中斷恢復）。
  * 規則見 sort-snapshot.buildRestorePlan：已刪除不重建、父資料夾不存在跳過、
  * 跨資料夾移動跳過、排序期間新增節點保留在尾端且相對順序不變。
+ *
+ * 缺陷 5：回傳的 stats 以 Executor 實際成功移動數為準，不用計畫預估值。
+ * 缺陷 6：優先從獨立的 SORT_SNAPSHOT_KEY 讀最初排序前的快照；若不存在才退回
+ *         最近一次 job 的 snapshot。restore 不覆蓋 SORT_SNAPSHOT_KEY，
+ *         只有使用者 discard 時才清除。
  */
 export async function restoreNativeBookmarks(): Promise<NativeBookmarkRestoreResult> {
   if (typeof chrome === 'undefined' || !chrome.bookmarks)
     throw new Error('bookmarks api unavailable')
 
-  const job = await nativeSortExecutor.getJob()
-  if (!job || !job.snapshot)
+  // 先安全停可能正在進行的 sort job：cancel() 不走 enqueue，立即觸發協作式取消
+  await nativeSortExecutor.cancel()
+  // 等待 enqueue 協調器讓 sort job 协程自然終止；restore 啟動前 preflightNoActive 會再檢查
+  await new Promise(r => setTimeout(r, 50))
+
+  // 缺陷 6：優先讀獨立的 SORT_SNAPSHOT_KEY（最初排序前快照），restore 完成前不清除
+  let snapshot: SnapshotData | null = null
+  try {
+    snapshot = (await chrome.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY] as SnapshotData | undefined
+    if (snapshot && typeof snapshot === 'object' && snapshot.folderOrders) {
+      // 有效，使用這個最初快照；最近一次 JOB_STORAGE_KEY 可能已被 restore job 覆蓋
+    }
+    else {
+      snapshot = null
+    }
+  }
+  catch {
+    snapshot = null
+  }
+
+  // 退回：最近一次 job 的 snapshot（可能是 sort job 或上一次 restore job）
+  if (!snapshot) {
+    const job = await nativeSortExecutor.getJob()
+    snapshot = job?.snapshot ?? null
+  }
+
+  if (!snapshot)
     throw new Error('no snapshot to restore')
 
   const tree = await readPlannerTree()
@@ -309,15 +357,23 @@ export async function restoreNativeBookmarks(): Promise<NativeBookmarkRestoreRes
   }
   indexTree(tree, undefined)
 
-  const restore = buildRestorePlan(job.snapshot, currentOrders)
+  const restore = buildRestorePlan(snapshot, currentOrders)
   // restore job 自己的快照：排序（復原）前的目前狀態
-  const restoreSnapshot = captureSnapshot(tree, Object.keys(job.snapshot.folderOrders))
+  const restoreSnapshot = captureSnapshot(tree, Object.keys(snapshot.folderOrders))
 
   const result = await nativeSortExecutor.runRestore(restore.targets, restoreSnapshot)
+  const job = result.job
+
+  // 缺陷 5：stats 以 Executor 實際移動數為準（不是計畫預估值）
+  // skipped 保留 buildRestorePlan 的計畫資訊（讓 UI 知道哪些節點因外部變動被跳過）
   return {
-    status: result.job.status,
-    stats: restore.stats,
+    status: job.status,
+    stats: {
+      restored: job.movedBookmarks + job.movedFolders,
+      skipped: restore.stats.skipped,
+      failed: (job.status === 'failed' || job.status === 'stopped-external') ? 1 : 0,
+    },
     skipped: restore.skipped,
-    error: result.job.error,
+    error: job.error,
   }
 }

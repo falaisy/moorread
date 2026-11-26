@@ -81,6 +81,14 @@ export interface StorageAdapter {
 
 export const JOB_STORAGE_KEY = 'moorread:sort-job'
 export const SESSION_STORAGE_KEY = 'moorread:sort-session'
+
+/**
+ * 最初排序前的原始 Snapshot，與 restore job 的快照獨立保存。
+ * - sort job 啟動時寫入；restore job 不覆蓋此鍵。
+ * - restore 完成且使用者放棄（discard）或明確接受後才清除。
+ * - 瀏覽器重啟後若 restore 尚未完成，仍可從此鍵回到最初順序。
+ */
+export const SORT_SNAPSHOT_KEY = 'moorread:sort-snapshot-original'
 const EVENT_WAIT_MS = 4000
 const RECENT_CONFIRMED_TTL_MS = 5000
 const MAX_MOVE_RETRIES = 1
@@ -183,6 +191,10 @@ export class SortExecutor {
   private orders: Map<string, string[]> = new Map()
   private readonly scopeSet: Set<string> = new Set() // 由目前 job 的 snapshot 載入
   private currentJobId: string | null = null
+  /** 协作式取消信号。cancel() 触发 abort()，所有 async 检查点终止 */
+  private abortCtrl: AbortController | null = null
+  /** 取消原因缓存，让等待中的协程能写入 status */
+  private cancelReason: string | null = null
 
   constructor(private readonly deps: Deps) {}
 
@@ -198,7 +210,9 @@ export class SortExecutor {
   }
 
   private async saveJob(job: JobRecord): Promise<void> {
-    const estimate = JSON.stringify(job).length
+    // 配額以 UTF-8 位元組計（Chrome storage quota 規範），不能用 String.length（UTF-16）
+    const serialized = JSON.stringify(job)
+    const estimate = new Blob([serialized]).size
     const used = await this.deps.storage.localGetBytesInUse(JOB_STORAGE_KEY).catch(() => 0)
     if (used + estimate > this.deps.storage.localQuotaBytes) {
       throw new Error('insufficient storage for sort job')
@@ -216,15 +230,19 @@ export class SortExecutor {
 
   private async readOrdersFor(folderIds: string[]): Promise<Map<string, string[]>> {
     const orders = new Map<string, string[]>()
+    const failed: string[] = []
     await Promise.all(folderIds.map(async (id) => {
       try {
         const children = await this.deps.bookmarks.getChildren(id)
         orders.set(id, children.map(n => n.id))
       }
       catch {
-        orders.set(id, [])
+        // 讀取失敗 → 不偽裝成空資料夾。必要 folder 的失敗由上層（createJob 或 continueJob）處理
+        failed.push(id)
       }
     }))
+    if (failed.length > 0)
+      throw new Error(`cannot read folders: ${failed.join(',')}`)
     return orders
   }
 
@@ -432,12 +450,34 @@ export class SortExecutor {
 
   /** 從目前 cursor 繼續執行（共用於首次執行與 SW 恢復） */
   private async continueJob(job: JobRecord): Promise<ExecutorResult> {
+    // 每次進入執行階段都重置 abortCtrl；cancel 走它而不走 enqueue 排隊
+    this.abortCtrl = new AbortController()
+    this.cancelReason = null
+
     this.setScopeFromSnapshot(job.snapshot)
-    // 同步快取 orders（若空則重讀）
-    if (this.orders.size === 0)
-      this.orders = await this.readOrdersFor([...this.scopeSet])
+    // 同步快取 orders（若空則重讀）；讀取失敗 → 工作立即失敗，不可偽裝
+    if (this.orders.size === 0) {
+      try {
+        this.orders = await this.readOrdersFor([...this.scopeSet])
+      }
+      catch (cause) {
+        job.status = 'failed'
+        job.error = cause instanceof Error ? cause.message : 'cannot read initial folder state'
+        await this.saveJob(job)
+        return { job, completed: false }
+      }
+    }
 
     for (let i = job.cursorFolderIndex; i < job.targets.length; i++) {
+      // 協作式取消檢查點：cancel() 立即生效，不排隊
+      if (this.abortCtrl?.signal.aborted) {
+        job.status = 'failed'
+        job.error = this.cancelReason ?? 'cancelled by user'
+        job.pending = null
+        await this.saveJob(job)
+        return { job, completed: false }
+      }
+
       const target = job.targets[i]
       const outcome = await this.processFolder(job, target)
       if (outcome === 'stop') {
@@ -456,8 +496,18 @@ export class SortExecutor {
       await this.saveJob(job)
     }
 
+    // 缺陷 1：驗證失敗 → 工作明確失敗，不可標記 completed
+    if (job.verificationFailures > 0) {
+      job.status = 'failed'
+      job.error = `verification failed on ${job.verificationFailures} folder(s)`
+      job.pending = null
+      await this.saveJob(job)
+      return { job, completed: false }
+    }
+
     job.status = 'completed'
     job.pending = null
+    job.error = undefined
     await this.saveJob(job)
     return { job, completed: true }
   }
@@ -465,12 +515,19 @@ export class SortExecutor {
   private async processFolder(job: JobRecord, target: TargetState): Promise<'ok' | 'stop'> {
     // 最多重複到目標達成或外部/失敗；每次重新讀實際順序並規劃向後搬
     for (;;) {
+      // 協作式取消檢查點
+      if (this.abortCtrl?.signal.aborted)
+        return 'stop'
       if (job.externalDirty || job.status !== 'active')
         return 'stop'
       const actual = await this.safeGetChildren(target.folderId)
       if (actual === null) {
+        // 缺陷 2：讀取失敗 → 真正的操作失敗，不是預期跳過。停止並標記失敗。
         job.skipped.push({ folderId: target.folderId, reason: 'cannot read folder' })
-        return 'ok' // 無法讀取就跳過此資料夾，繼續下一個（不擴大損害）
+        job.status = 'failed'
+        job.error = `cannot read folder: ${target.folderId}`
+        await this.saveJob(job)
+        return 'stop'
       }
       this.orders.set(target.folderId, actual)
       const steps = planFolderMoves(actual, target.order)
@@ -516,6 +573,12 @@ export class SortExecutor {
     folderId: string,
     step: { id: string, from: number, to: number },
   ): Promise<'ok' | 'stop'> {
+    // move 前檢查取消（避免在已取消狀態下仍呼叫 Chrome API）
+    if (this.abortCtrl?.signal.aborted) {
+      job.status = 'failed'
+      job.error = this.cancelReason ?? 'cancelled by user'
+      return 'stop'
+    }
     const actual = this.orders.get(folderId) ?? []
     const oldIndex = actual.indexOf(step.id)
     if (oldIndex === -1) {
@@ -540,6 +603,15 @@ export class SortExecutor {
     await this.saveJob(job) // 1. 保存 pending
 
     for (let attempt = 0; attempt <= MAX_MOVE_RETRIES; attempt++) {
+      // 每輪 retry 開始前再次檢查取消
+      if (this.abortCtrl?.signal.aborted) {
+        job.status = 'failed'
+        job.error = this.cancelReason ?? 'cancelled by user'
+        job.pending = pending // 保留 pending 供稽核
+        await this.saveJob(job)
+        return 'stop'
+      }
+
       // 2. 登記預期事件
       const waiter = this.registerExpected(pending)
       // 3. 呼叫 move
@@ -631,18 +703,50 @@ export class SortExecutor {
 
   private waitForEvent(entry: ExpectedMove): Promise<'matched' | 'external' | 'timeout'> {
     const promise = (entry as unknown as { promise: Promise<void> }).promise
+    const ctrl = this.abortCtrl
     return new Promise((resolve) => {
       const timer = setTimeout(resolve, this.deps.eventWaitMs ?? EVENT_WAIT_MS, 'timeout')
-      promise.then(
-        () => {
-          clearTimeout(timer)
-          resolve('matched')
-        },
-        () => {
+      // 协作式取消：cancel() 触发 abort 后，等待中的 waiter 立即 resolve 'external'
+      const onAbort = () => {
+        clearTimeout(timer)
+        // reject head 让 markExternal 处理外部变动路径（或直接 resolve 'external'）
+        if (this.expected[0] === entry)
+          entry.reject('external')
+        else
+          resolve('external')
+      }
+      if (ctrl?.signal) {
+        if (ctrl.signal.aborted) {
           clearTimeout(timer)
           resolve('external')
-        },
-      )
+          return
+        }
+        ctrl.signal.addEventListener('abort', onAbort, { once: true })
+        promise.then(
+          () => {
+            clearTimeout(timer)
+            ctrl.signal.removeEventListener('abort', onAbort)
+            resolve('matched')
+          },
+          () => {
+            clearTimeout(timer)
+            ctrl.signal.removeEventListener('abort', onAbort)
+            resolve('external')
+          },
+        )
+      }
+      else {
+        promise.then(
+          () => {
+            clearTimeout(timer)
+            resolve('matched')
+          },
+          () => {
+            clearTimeout(timer)
+            resolve('external')
+          },
+        )
+      }
     })
   }
 
@@ -658,8 +762,10 @@ export class SortExecutor {
       const job = await this.loadJob()
       if (!job)
         return null
-      if (job.status === 'completed' || job.status === 'failed' || job.status === 'stopped-external')
+      // completed → 已完成，SW 重啟不需恢復（但 original snapshot 可能仍存在供 restore 入口）
+      if (job.status === 'completed')
         return null
+      // failed / stopped-external / awaiting-user → 都保留供 UI 顯示，不清除
 
       const session = await this.deps.storage.sessionGet<{ sessionId: string }>(SESSION_STORAGE_KEY)
       if (!session || session.sessionId !== job.sessionId) {
@@ -698,7 +804,17 @@ export class SortExecutor {
 
   private async recoverAndContinue(job: JobRecord): Promise<JobRecord> {
     this.setScopeFromSnapshot(job.snapshot)
-    this.orders = await this.readOrdersFor([...this.scopeSet])
+    // 讀取失敗 → 工作失敗，不可偽裝成空
+    try {
+      this.orders = await this.readOrdersFor([...this.scopeSet])
+    }
+    catch (cause) {
+      job.status = 'failed'
+      job.error = cause instanceof Error ? cause.message : 'cannot read initial folder state'
+      job.pending = null
+      await this.saveJob(job)
+      return job
+    }
     const hNow = fingerprint(this.orders)
 
     if (job.pending) {
@@ -744,22 +860,38 @@ export class SortExecutor {
 
   /** 使用者放棄中斷的工作（清除記錄；快照一併清除） */
   async discardJob(): Promise<void> {
+    // 取消中的工作若有 abort 信号一并触发，避免卡在 waitForEvent
+    this.abortCtrl?.abort()
     await this.enqueue(async () => {
+      await this.deps.storage.localRemove(SORT_SNAPSHOT_KEY)
       await this.clearJob()
     })
   }
 
-  /** 安全取消目前工作（保留快照與記錄，狀態標記為 stopped-external 以外的可查狀態） */
+  /**
+   * 安全取消目前工作：**不走 enqueue 排队**，立即触发协作式取消信号。
+   * - abort 后 continueJob/processFolder/executeMove/waitForEvent 所有检查点终止
+   * - 保留 Snapshot、pending 和当前 job 记录，状态标记为 failed，error 记录取消原因
+   * - 保存后即使 SW 休眠或重啟，仍可从 resumeAfterRestart 看到取消状态
+   */
   async cancel(): Promise<void> {
-    await this.enqueue(async () => {
+    // 同步触发 abort，让所有 async 检查点立即生效
+    this.cancelReason = 'cancelled by user'
+    this.abortCtrl?.abort()
+    // 立即保存取消状态（不走 enqueue，避免排队）
+    try {
       const job = await this.loadJob()
-      if (!job || job.status !== 'active')
-        return
-      job.status = 'stopped-external'
-      job.error = 'cancelled by user'
-      job.pending = null
-      await this.saveJob(job)
-    })
+      // active / awaiting-user 都視為可中止：awaiting-user 若被中止（例如使用者改選擇復原），
+      // 必須標 failed 才能通過 restore 的 preflightNoActive，且不得虛報為完成。
+      if (job && (job.status === 'active' || job.status === 'awaiting-user')) {
+        job.status = 'failed'
+        job.error = this.cancelReason
+        await this.saveJob(job)
+      }
+    }
+    catch {
+      // 保存失败不抛给调用者：abort 信号已发出，协程会自行终止
+    }
   }
 
   async getJob(): Promise<JobRecord | null> {

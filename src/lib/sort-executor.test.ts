@@ -80,6 +80,8 @@ class MockBookmarks implements BookmarkAdapter {
   mismatchMoveIds = new Set<string>()
   duplicateMoveIds = new Set<string>()
   hangMoveIds = new Set<string>()
+  /** getChildren 對此 folderId 抛错（模擬讀取失敗） */
+  failReadIds = new Set<string>()
 
   wire(executor: SortExecutor): () => void {
     const moved = (id: string, info: MoveEventInfo) => executor.onMoved(id, info)
@@ -117,6 +119,9 @@ class MockBookmarks implements BookmarkAdapter {
   }
 
   async getChildren(folderId: string): Promise<SortBookmarkNode[]> {
+    // 模擬讀取失敗
+    if (this.failReadIds.has(folderId))
+      throw new Error(`mock read failed: ${folderId}`)
     const ids = this.children.get(folderId) ?? []
     return ids.map((id, index) => {
       const m = this.meta.get(id) ?? { id, parentId: folderId, isFolder: false }
@@ -671,6 +676,150 @@ describe('executor — 儲存容量不足時拒絕開始', () => {
     const { tree, snapshot } = makeTree(['B', 'A'])
     bookmarks.setFolder('1', ['B', 'A'])
     const exec = makeExecutor(bookmarks, storage)
+    await expect(exec.runSort(planTargets(tree, ascTitle), snapshot)).rejects.toThrow(/insufficient storage/)
+  })
+})
+
+/* ========================= D2 缺陷：验证失败不得 completed ========================= */
+describe('d2-1 — 最终验证失败 → 工作明確 failed，不可 completed', () => {
+  it('continueJob 結束時 verificationFailures > 0 → status=failed', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    const exec = makeExecutor(bookmarks, storage)
+
+    // 第一次 runSort：正常完成（A→B）
+    const first = await exec.runSort(planTargets(tree, ascTitle), snapshot)
+    expect(first.completed).toBe(true)
+    expect(first.job.status).toBe('completed')
+
+    // 手动改 job：注入 verificationFailures + status 改成 awaiting-user（讓 resumeAfterRestart 進入 recoverAndContinue）
+    const job = (await storage.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    job.verificationFailures = 2
+    job.status = 'awaiting-user'
+    job.cursorFolderIndex = 0
+    job.foldersProcessed = 0
+    // bookmarks 此时已经是 ['A', 'B']（正确顺序），所以 verifyFolder 不会新增 failures
+    // 但 continueJob 循环结束后会检查 job.verificationFailures → 标 failed
+
+    // 清空 orders 快取让 continueJob 重建
+    const exec2 = makeExecutor(bookmarks, storage)
+    const resumed = await exec2.resumeAfterRestart()
+    // resumeAfterRestart → recoverAndContinue → continueJob → 循环结束 → verificationFailures=2 > 0 → 强制标 failed
+    expect(resumed.status).toBe('failed')
+    expect(resumed.verificationFailures).toBe(2)
+  })
+})
+
+/* ========================= D2 缺陷：資料夾讀取失敗不可當成成功 ========================= */
+describe('d2-2 — getChildren 失敗 → status=failed，不可偽裝成空資料夾', () => {
+  it('createJob 阶段 scope 内 folder 讀取失敗 → 拒絕啟動（抛错）', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    bookmarks.failReadIds.add('1') // 讀取 folder 1 抛错
+    const exec = makeExecutor(bookmarks, storage)
+    await expect(exec.runSort(planTargets(tree, ascTitle), snapshot)).rejects.toThrow()
+  })
+
+  it('continueJob 重建 orders 时 safeGetChildren 讀取失敗 → status=failed', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'A', 'B'])
+    bookmarks.setFolder('1', ['C', 'A', 'B'])
+    const exec = makeExecutor(bookmarks, storage)
+
+    const targets = planTargets(tree, ascTitle)
+    // 第一次 runSort 成功；orders 快取建立
+    const first = await exec.runSort(targets, snapshot)
+    expect(first.completed).toBe(true)
+
+    // 建立 resume 情境：清空 orders 快取、注入 failReadIds、让 continueJob 重建 orders 时失败
+    bookmarks.failReadIds.add('1')
+    const job = (await storage.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    job.status = 'awaiting-user' // 让 resumeAfterRestart 进入 recoverAndContinue
+    job.cursorFolderIndex = 0
+    await storage.localSet(JOB_STORAGE_KEY, job)
+
+    const exec2 = makeExecutor(bookmarks, storage)
+    // resumeAfterRestart → recoverAndContinue → continueJob → orders 空 → readOrdersFor([...scopeSet]) → folder 1 失败
+    // readOrdersFor 抛错 → continueJob catch → 标 failed → 返回
+    const resumed = await exec2.resumeAfterRestart()
+    expect(resumed.status).toBe('failed')
+    expect(resumed.error).toMatch(/cannot read/)
+  })
+})
+
+/* ========================= D2 缺陷：cancel 及時生效 ========================= */
+describe('d2-7 — cancel() 協作式取消，不排隊、立即生效', () => {
+  it('active job 進行中 → cancel() 立即停止，不等待 enqueue 排隊', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    // 让 move 事件延迟，确保 executor 进入 waitForEvent 阶段
+    bookmarks.eventDelayMs = 100
+    const exec = makeExecutor(bookmarks, storage, 500)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    // 等一下让 executor 进入 processFolder → executeMove → waitForEvent
+    await new Promise(r => setTimeout(r, 15))
+    // 立即 cancel（不走 enqueue 排队）
+    await exec.cancel()
+    const result = await p
+    expect(result.completed).toBe(false)
+    expect(result.job.status).toBe('failed')
+    expect(result.job.error).toBe('cancelled by user')
+  })
+
+  it('已取消 job → 再次 cancel 不报错；cancel 狀態可查', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    const exec = makeExecutor(bookmarks, storage)
+    // 没有 active job 时 cancel 应静默 no-op
+    await expect(exec.cancel()).resolves.not.toThrow()
+    const res = await exec.runSort(planTargets(tree, ascTitle), snapshot)
+    expect(res.completed).toBe(true)
+  })
+
+  it('cancel 後 discard 清除 original snapshot 與 job 記錄', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    bookmarks.eventDelayMs = 100
+    const exec = makeExecutor(bookmarks, storage, 500)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 15))
+    await exec.cancel()
+    await p
+    expect((await storage.localGet<JobRecord>(JOB_STORAGE_KEY))?.status).toBe('failed')
+    await exec.discardJob()
+    expect(await storage.localGet(JOB_STORAGE_KEY)).toBeUndefined()
+  })
+})
+
+/* ========================= D2 HQ-9 — 配額估算用 UTF-8 位元組 ========================= */
+describe('d2-HQ9 — 儲存配額估算使用 UTF-8 位元組數', () => {
+  it('含中文的 job 估算以 UTF-8 計（非 UTF-16 code unit）', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    // 計算：含中文的 JSON.stringify 長度 vs Blob.size
+    const withChinese = JSON.stringify({ msg: '測試配額估算' })
+    const utf16 = withChinese.length // = 15 字元 × 2 bytes = 30 code units
+    const utf8 = new Blob([withChinese]).size // 含 5 個中文字 × 3 bytes = 15 + 其餘
+    expect(utf8).toBeGreaterThan(utf16) // 確認 Blob.size 比 length 大
+
+    // 驗證 MockStorage.localQuotaBytes 若設太小 → 含中文 job 會被拒絕
+    storage.localQuotaBytes = 40 // 極小
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    const exec = makeExecutor(bookmarks, storage)
+    // sortNativeBookmarks 會保存 snapshot 到 storage（executor.createJob）
+    // 配額 40 bytes 太小 → 抛错
     await expect(exec.runSort(planTargets(tree, ascTitle), snapshot)).rejects.toThrow(/insufficient storage/)
   })
 })

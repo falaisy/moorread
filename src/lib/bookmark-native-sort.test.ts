@@ -10,8 +10,10 @@ import {
 
   normalizeSortCriteria,
   planFolderMoves,
+  restoreNativeBookmarks,
   sortNativeBookmarks,
 } from './bookmark-native-sort'
+import { JOB_STORAGE_KEY, SORT_SNAPSHOT_KEY } from './sort-executor'
 
 function node(partial: Partial<BookmarkTreeNode> & { id: string }): BookmarkTreeNode {
   return { syncing: false, children: undefined, ...partial } as BookmarkTreeNode
@@ -422,5 +424,100 @@ describe('planFolderMoves', () => {
   it('ignores entries that no longer exist in the folder', () => {
     const steps = planFolderMoves(asNodes(['A', 'B']), asNodes(['B', 'A', 'gone']))
     expect(steps.every(step => step.id !== 'gone')).toBe(true)
+  })
+})
+
+describe('restoreNativeBookmarks — 復原統計、原始快照保護與 awaiting-user（缺陷 5/6、HQ-3）', () => {
+  it('restore 統計以實際移動數計，且不覆蓋最初快照', async () => {
+    const m = makeChromeMock({
+      f: [
+        { id: 'z', title: 'Zebra', url: 'https://z.co' },
+        { id: 'a', title: 'Alpha', url: 'https://a.co' },
+      ],
+    })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    // 排序：z,a → a,z（1 次 move）
+    const sorted = await sortNativeBookmarks({
+      scope: 'selected-with-sub',
+      targetFolderIds: ['f'],
+      ignoreFolderIds: [],
+      sortCriteria: titleAsc,
+      sortSelf: true,
+      recurse: false,
+    })
+    expect(sorted.status).toBe('completed')
+    expect(m.live.f.map(n => n.id)).toEqual(['a', 'z'])
+
+    // 最初快照已獨立保存
+    const snapBefore = await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY)
+    expect(snapBefore[SORT_SNAPSHOT_KEY]).toBeTruthy()
+
+    // 復原：a,z → z,a
+    const restored = await restoreNativeBookmarks()
+    expect(restored.status).toBe('completed')
+    expect(m.live.f.map(n => n.id)).toEqual(['z', 'a'])
+    // 缺陷 5：restored 為實際移動數（1 次），不是計畫預估
+    expect(restored.stats.restored).toBe(1)
+    expect(restored.stats.failed).toBe(0)
+    // 缺陷 6：最初快照未被 restore 覆蓋或刪除
+    const snapAfter = await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY)
+    expect(snapAfter[SORT_SNAPSHOT_KEY]).toBeTruthy()
+  })
+
+  it('已是最初順序時復原不移動任何節點', async () => {
+    const m = makeChromeMock({
+      f: [
+        { id: 'a', title: 'Alpha', url: 'https://a.co' },
+        { id: 'z', title: 'Zebra', url: 'https://z.co' },
+      ],
+    })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    // 排序後仍為 a,z（本來就正確）
+    await sortNativeBookmarks({
+      scope: 'selected-with-sub',
+      targetFolderIds: ['f'],
+      ignoreFolderIds: [],
+      sortCriteria: titleAsc,
+      sortSelf: true,
+      recurse: false,
+    })
+    const restored = await restoreNativeBookmarks()
+    expect(restored.status).toBe('completed')
+    expect(restored.stats.restored).toBe(0)
+    expect(m.live.f.map(n => n.id)).toEqual(['a', 'z'])
+  })
+
+  it('hQ-3：awaiting-user 的排序工作可被安全復原（cancel 後 preflight 通過）', async () => {
+    const m = makeChromeMock({
+      f: [
+        { id: 'z', title: 'Zebra', url: 'https://z.co' },
+        { id: 'a', title: 'Alpha', url: 'https://a.co' },
+      ],
+    })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    // 先排序並完成，留下最初快照
+    await sortNativeBookmarks({
+      scope: 'selected-with-sub',
+      targetFolderIds: ['f'],
+      ignoreFolderIds: [],
+      sortCriteria: titleAsc,
+      sortSelf: true,
+      recurse: false,
+    })
+    expect(m.live.f.map(n => n.id)).toEqual(['a', 'z'])
+
+    // 模擬瀏覽器重啟後待使用者確認的中斷工作
+    const raw = await m.chromeMock.storage.local.get(JOB_STORAGE_KEY)
+    const job = raw[JOB_STORAGE_KEY] as { status: string }
+    job.status = 'awaiting-user'
+    await m.chromeMock.storage.local.set({ [JOB_STORAGE_KEY]: job })
+
+    // 復原不應因 awaiting-user 被 preflight 拒絕
+    const restored = await restoreNativeBookmarks()
+    expect(restored.status).toBe('completed')
+    expect(m.live.f.map(n => n.id)).toEqual(['z', 'a'])
   })
 })

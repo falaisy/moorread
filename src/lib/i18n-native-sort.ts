@@ -28,10 +28,37 @@ const zhTW = {
   nativeSortScopeTitle: '排什麼',
   nativeSortScopeAll: '所有資料夾',
   nativeSortScopeAllHint: 'Chrome 內建的根節點（書籤列、其他書籤）自動跳過',
+  nativeSortScopeSelectedOnly: '只排我選的資料夾（不含子資料夾）',
+  nativeSortScopeSelectedOnlyHint: '只排我勾選的那幾層，裡面子資料夾不動',
   nativeSortScopeSelectedWithSub: '我選的資料夾 + 它們裡面全部子資料夾',
   nativeSortScopeSelectedWithSubHint: '包括我選的資料夾本身也會被排',
   nativeSortScopeChildrenOnly: '只排我選的資料夾裡面的子資料夾',
   nativeSortScopeChildrenOnlyHint: '我選的資料夾本身不動',
+
+  // 排序模式（sortMode）
+  nativeSortModeTitle: '排序模式',
+  nativeSortModeCriteria: '依規則',
+  nativeSortModeCriteriaHint: '用下面設定的排序依據自動排',
+  nativeSortModeManual: '手動',
+  nativeSortModeManualHint: '保留你目前的原生順序，自動排序不會覆蓋',
+  nativeSortModeRandom: '隨機',
+  nativeSortModeRandomHint: '每次排序都重新洗牌，並保存本次結果供復原',
+
+  // 置頂 / 置底
+  nativeSortPinnedTitle: '置頂與置底',
+  nativeSortPinnedDescription:
+    '輸入書籤 ID（可用逗號或空白分隔）。置頂優先於置底；重複與衝突會自動去除。',
+  nativeSortPinnedTopLabel: '置頂書籤 ID',
+  nativeSortPinnedBottomLabel: '置底書籤 ID',
+  nativeSortPinnedTopPlaceholder: '例如：123, 456',
+  nativeSortPinnedBottomPlaceholder: '例如：789',
+
+  // 資料夾獨立規則
+  nativeSortFolderRulesTitle: '資料夾獨立規則',
+  nativeSortFolderRulesDescription:
+    '為個別資料夾指定與全域不同的排序模式；子資料夾若沒有自己的規則，會繼承最近祖先的設定。',
+  nativeSortFolderRulesEmpty: '尚未設定任何資料夾規則',
+  nativeSortAddFolderRule: '新增規則',
 
   // sortSelf 獨立開關
   nativeSortSortSelf: '排序目標資料夾本身',
@@ -80,6 +107,8 @@ const zhTW = {
   nativeSortJobResume: '繼續',
   nativeSortJobRestore: '復原快照',
   nativeSortJobDiscard: '捨棄',
+  nativeSortJobDismiss: '關閉提示',
+  nativeSortJobCompleted: '上次排序已完成。仍可復原到排序前，或關閉此提示。',
 }
 
 type NativeSortMessages = Record<keyof typeof zhTW, string>
@@ -111,10 +140,34 @@ const en: NativeSortMessages = {
   nativeSortScopeTitle: 'What to sort',
   nativeSortScopeAll: 'All folders',
   nativeSortScopeAllHint: 'Built-in Chrome roots (Bookmarks Bar, Other Bookmarks) are skipped automatically',
+  nativeSortScopeSelectedOnly: 'Only the folders I pick (no subfolders)',
+  nativeSortScopeSelectedOnlyHint: 'Only the levels I select; their subfolders stay untouched',
   nativeSortScopeSelectedWithSub: 'Folders I pick + all their subfolders',
   nativeSortScopeSelectedWithSubHint: 'Includes the folders I pick themselves',
   nativeSortScopeChildrenOnly: 'Only subfolders inside folders I pick',
   nativeSortScopeChildrenOnlyHint: 'The folders I pick themselves stay untouched',
+
+  nativeSortModeTitle: 'Sort mode',
+  nativeSortModeCriteria: 'By rule',
+  nativeSortModeCriteriaHint: 'Sort automatically using the rules below',
+  nativeSortModeManual: 'Manual',
+  nativeSortModeManualHint: 'Keep your current native order; auto-sort will not override it',
+  nativeSortModeRandom: 'Random',
+  nativeSortModeRandomHint: 'Reshuffles on every sort and saves the result for restore',
+
+  nativeSortPinnedTitle: 'Pin to top / bottom',
+  nativeSortPinnedDescription:
+    'Enter bookmark IDs (comma or space separated). Top wins over bottom; duplicates and conflicts are removed.',
+  nativeSortPinnedTopLabel: 'Pin-to-top bookmark IDs',
+  nativeSortPinnedBottomLabel: 'Pin-to-bottom bookmark IDs',
+  nativeSortPinnedTopPlaceholder: 'e.g. 123, 456',
+  nativeSortPinnedBottomPlaceholder: 'e.g. 789',
+
+  nativeSortFolderRulesTitle: 'Per-folder rules',
+  nativeSortFolderRulesDescription:
+    'Give individual folders a different sort mode. Subfolders without their own rule inherit the nearest ancestor.',
+  nativeSortFolderRulesEmpty: 'No per-folder rules yet',
+  nativeSortAddFolderRule: 'Add rule',
 
   nativeSortSortSelf: 'Sort target folders themselves',
   nativeSortSortSelfDescription:
@@ -159,6 +212,8 @@ const en: NativeSortMessages = {
   nativeSortJobResume: 'Resume',
   nativeSortJobRestore: 'Restore snapshot',
   nativeSortJobDiscard: 'Discard',
+  nativeSortJobDismiss: 'Dismiss',
+  nativeSortJobCompleted: 'The last sort completed. You can still restore the pre-sort order, or dismiss this.',
 }
 
 export const nativeSortMessages: Record<Language, NativeSortMessages> = {

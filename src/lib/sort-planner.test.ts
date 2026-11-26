@@ -243,6 +243,66 @@ describe('computeTargetOrder — 手動/隨機/置頂置底', () => {
   })
 })
 
+describe('d2 pinned 去重與互斥（HQ-6）', () => {
+  const children = [bm('A'), bm('B'), bm('C')]
+
+  it('pinnedTop 內重複 id 只出現一次，target 長度不變', () => {
+    const order = computeTargetOrder(children, {
+      mode: 'criteria',
+      criteria: [{ field: 'title', direction: 'asc' }],
+      pinnedTop: ['C', 'C', 'C'],
+    })
+    expect(order.filter(id => id === 'C')).toHaveLength(1)
+    expect(order).toHaveLength(3)
+  })
+
+  it('同一 id 同時在 top 與 bottom → 留在 top，不重複', () => {
+    const order = computeTargetOrder(children, {
+      mode: 'criteria',
+      criteria: [{ field: 'title', direction: 'asc' }],
+      pinnedTop: ['B'],
+      pinnedBottom: ['B'],
+    })
+    expect(order[0]).toBe('B')
+    expect(order.filter(id => id === 'B')).toHaveLength(1)
+    expect(order).toHaveLength(3)
+  })
+
+  it('top/bottom 各自去重後仍保持使用者指定順序', () => {
+    const order = computeTargetOrder(children, {
+      mode: 'criteria',
+      criteria: [{ field: 'title', direction: 'asc' }],
+      pinnedTop: ['C', 'A', 'C'],
+      pinnedBottom: ['B', 'B'],
+    })
+    expect(order.slice(0, 2)).toEqual(['C', 'A'])
+    expect(order[order.length - 1]).toBe('B')
+  })
+})
+
+describe('d2 random seed 可重現且可恢復（HQ-7）', () => {
+  const children = [bm('A'), bm('B'), bm('C'), bm('D'), bm('E')]
+
+  it('相同 seed → 完全相同順序（恢復時不會重新洗牌）', () => {
+    const a = computeTargetOrder(children, { mode: 'random', seed: 12345 })
+    const b = computeTargetOrder(children, { mode: 'random', seed: 12345 })
+    expect(a).toEqual(b)
+  })
+
+  it('不同 seed → 至少一種排列不同（避免固定 seed 永遠同序）', () => {
+    const a = computeTargetOrder(children, { mode: 'random', seed: 1 })
+    const b = computeTargetOrder(children, { mode: 'random', seed: 2 })
+    const c = computeTargetOrder(children, { mode: 'random', seed: 3 })
+    const distinct = new Set([a.join(','), b.join(','), c.join(',')])
+    expect(distinct.size).toBeGreaterThan(1)
+  })
+
+  it('random 結果是原集合的排列（不增不減不重複）', () => {
+    const order = computeTargetOrder(children, { mode: 'random', seed: 777 })
+    expect([...order].sort()).toEqual(['A', 'B', 'C', 'D', 'E'])
+  })
+})
+
 describe('buildSortPlan end-to-end', () => {
   it('sorts a folder by title asc', () => {
     const tree = [folder('0', [folder('1', [bm('Zebra'), bm('Alpha'), bm('Mango')])])]

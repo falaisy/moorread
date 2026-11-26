@@ -407,8 +407,12 @@ export function computeTargetOrder(
   const ids = children.map(c => c.id)
   const idSet = new Set(ids)
 
-  const pinnedTop = (rule.pinnedTop ?? []).filter(id => idSet.has(id))
-  const pinnedBottom = (rule.pinnedBottom ?? []).filter(id => idSet.has(id))
+  const pinnedTop = [...new Set((rule.pinnedTop ?? []).filter(id => idSet.has(id)))]
+  // 互斥：同時出現在 top + bottom 的 id 留在 top
+  const topSet = new Set(pinnedTop)
+  const pinnedBottom = [...new Set(
+    (rule.pinnedBottom ?? []).filter(id => idSet.has(id) && !topSet.has(id)),
+  )]
   const pinnedSet = new Set([...pinnedTop, ...pinnedBottom])
   const rest = children.filter(c => !pinnedSet.has(c.id))
 

@@ -76,11 +76,40 @@ async function loadSettings(): Promise<NativeBookmarkSortSettings | null> {
   }
 }
 
-/** 該資料夾是否為手動模式（手動模式自動排完全不動，保留使用者原生順序） */
-function isManualFolder(folderId: string, settings: NativeBookmarkSortSettings): boolean {
-  const override = settings.folderRules?.find(r => r.folderId === folderId)
-  const mode = override?.rule.mode ?? settings.sortMode ?? 'criteria'
-  return mode === 'manual'
+/**
+ * 該資料夾是否為手動模式（手動模式自動排完全不動，保留使用者原生順序）
+ * HQ-5：必須沿祖先鏈檢查 manual 規則，正確處理規則繼承。
+ */
+async function isManualFolder(folderId: string, settings: NativeBookmarkSortSettings): Promise<boolean> {
+  const globalMode = settings.sortMode ?? 'criteria'
+  if (globalMode === 'manual')
+    return true
+
+  // 建立 parentId 映射，沿祖先鏈查 folderRules
+  const parentMap = new Map<string, string | undefined>()
+  try {
+    const tree = await chrome.bookmarks.getTree()
+    const walk = (nodes: Array<{ id: string, parentId?: string }>, parentId: string | undefined): void => {
+      for (const n of nodes) {
+        parentMap.set(n.id, parentId)
+        walk((n as { children?: Array<{ id: string, parentId?: string }> }).children ?? [], n.id)
+      }
+    }
+    walk(tree, undefined)
+  }
+  catch {
+    // 無法讀書籤樹 → 退回只查全局
+    return false
+  }
+
+  let cur: string | undefined = folderId
+  while (cur) {
+    const override = settings.folderRules?.find(r => r.folderId === cur)
+    if (override)
+      return override.rule.mode === 'manual'
+    cur = parentMap.get(cur)
+  }
+  return false
 }
 
 function isFolderAllowed(folderId: string, settings: NativeBookmarkSortSettings): boolean {
@@ -125,6 +154,8 @@ async function flush(): Promise<void> {
   if (flushing)
     return
   flushing = true
+  // 同一次 flush 內每個資料夾只嘗試一次，避免持續失敗者被無限快速重試
+  const attempted = new Set<string>()
   try {
     const settings = await loadSettings()
     if (!settings?.enabled || !settings.autoSort) {
@@ -133,21 +164,39 @@ async function flush(): Promise<void> {
       return
     }
 
-    const pending = await readPending()
-    for (const folderId of [...pending]) {
-      if (!isFolderAllowed(folderId, settings) || isManualFolder(folderId, settings)) {
+    // HQ-4：正確傳遞 scope（selected-with-sub 要讓 Planner 自動展開子資料夾）
+    const effectiveScope: NativeSortScope = settings.scope === 'all' || settings.scope === 'selected-with-sub'
+      ? settings.scope
+      : 'selected-only'
+
+    // 缺陷 3+4：循環處理 pending —— 每次從 storage 讀最新狀態、完成後立即寫回，
+    // 讓 enqueue 期間新加入的 folderId 不被 flush 的舊 Set 覆蓋。
+    // 每個資料夾在同一輪只嘗試一次；失敗/外部變動/忙碌者 **保留** 在 pending，
+    // 等下一次書籤事件或 SW 啟動再處理（不立即重試，避免迴圈）。
+    for (;;) {
+      const pending = await readPending()
+      const folderId = [...pending].find(id => !attempted.has(id))
+      if (!folderId)
+        break
+      attempted.add(folderId)
+
+      // HQ-5 + 範圍檢查
+      const manual = await isManualFolder(folderId, settings)
+      if (!isFolderAllowed(folderId, settings) || manual) {
+        // 不處理的 folder：從 pending 移除（一次性決策）
         pending.delete(folderId)
+        await writePending(pending)
         continue
       }
+
       try {
-        // selected-only + recurse=false：只排事件那層，不鑽子資料夾
-        await sortNativeBookmarks({
-          scope: 'selected-only',
-          targetFolderIds: [folderId],
+        const res = await sortNativeBookmarks({
+          scope: effectiveScope,
+          targetFolderIds: settings.scope === 'all' ? [] : [folderId],
           ignoreFolderIds: settings.ignoreFolderIds,
           sortCriteria: settings.sortCriteria,
           sortSelf: true,
-          recurse: false,
+          recurse: true,
           sortMode: settings.sortMode,
           randomSeed: settings.randomSeed,
           pinnedTop: settings.pinnedTop,
@@ -155,23 +204,26 @@ async function flush(): Promise<void> {
           foldersFirst: settings.foldersFirst,
           folderRules: settings.folderRules,
         })
+        // 缺陷 3：只有 status === 'completed' 才從 pending 移除
+        if (res.status === 'completed') {
+          const current = await readPending()
+          current.delete(folderId)
+          await writePending(current)
+        }
+        // 非 completed（failed / stopped-external / awaiting-user）：**保留** pending
       }
       catch {
-        // 忙碌中（單一執行控制）或外部變動停止：不重試當次，留在佇列由下次事件/啟動處理
-      }
-      finally {
-        pending.delete(folderId)
+        // 忙碌中（單一執行控制）或 API 錯誤：**保留** pending 到下次
       }
     }
-    await writePending(pending)
-
-    // 執行期間若又累積新事件，接著排
-    const next = await readPending()
-    if (next.size > 0)
-      scheduleFlush()
   }
   finally {
     flushing = false
+    // 若 flush 期間又新增了尚未嘗試的資料夾，再排一次；
+    // 已嘗試但失敗者仍在 attempted，不會被立即重試。
+    const left = await readPending()
+    if ([...left].some(id => !attempted.has(id)))
+      scheduleFlush()
   }
 }
 

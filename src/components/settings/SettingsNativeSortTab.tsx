@@ -44,6 +44,11 @@ const SCOPE_OPTIONS: Array<{
     hintKey: 'nativeSortScopeAllHint',
   },
   {
+    value: 'selected-only',
+    labelKey: 'nativeSortScopeSelectedOnly',
+    hintKey: 'nativeSortScopeSelectedOnlyHint',
+  },
+  {
     value: 'selected-with-sub',
     labelKey: 'nativeSortScopeSelectedWithSub',
     hintKey: 'nativeSortScopeSelectedWithSubHint',
@@ -53,6 +58,16 @@ const SCOPE_OPTIONS: Array<{
     labelKey: 'nativeSortScopeChildrenOnly',
     hintKey: 'nativeSortScopeChildrenOnlyHint',
   },
+] as const
+
+const SORT_MODE_OPTIONS: Array<{
+  value: NonNullable<NativeBookmarkSortSettings['sortMode']>
+  labelKey: MessageKey
+  hintKey: MessageKey
+}> = [
+  { value: 'criteria', labelKey: 'nativeSortModeCriteria', hintKey: 'nativeSortModeCriteriaHint' },
+  { value: 'manual', labelKey: 'nativeSortModeManual', hintKey: 'nativeSortModeManualHint' },
+  { value: 'random', labelKey: 'nativeSortModeRandom', hintKey: 'nativeSortModeRandomHint' },
 ] as const
 
 interface SortRunResult {
@@ -72,7 +87,11 @@ export function SettingsNativeSortTab() {
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [ignorePickerOpen, setIgnorePickerOpen] = useState(false)
+  const [rulePickerOpen, setRulePickerOpen] = useState(false)
+  const [ruleMode, setRuleMode] = useState<NonNullable<NativeBookmarkSortSettings['sortMode']>>('manual')
   const [job, setJob] = useState<JobRecord | null>(null)
+  // completed 工作僅在本次開啟設定頁時隱藏；重新進入仍可復原（不刪除快照）
+  const [dismissedCompleted, setDismissedCompleted] = useState(false)
 
   // 輪詢執行器工作狀態（SW 休眠/重啟後的中斷工作需要讓使用者看見並處置）
   useEffect(() => {
@@ -102,6 +121,20 @@ export function SettingsNativeSortTab() {
 
   const handleIgnorePickerConfirm = (ids: string[]) => {
     update({ ignoreFolderIds: ids })
+  }
+
+  /** 以目前選擇的模式，為勾選的資料夾建立/覆寫獨立規則 */
+  const handleRulePickerConfirm = (ids: string[]) => {
+    const existing = (settings.folderRules ?? []).filter(r => !ids.includes(r.folderId))
+    const added = ids.map(id => ({
+      folderId: id,
+      rule: { mode: ruleMode, criteria: ruleMode === 'criteria' ? settings.sortCriteria : [] },
+    }))
+    update({ folderRules: [...existing, ...added] })
+  }
+
+  const removeFolderRule = (folderId: string) => {
+    update({ folderRules: (settings.folderRules ?? []).filter(r => r.folderId !== folderId) })
   }
 
   /** 新增一個排序依據（預設 title asc） */
@@ -145,6 +178,10 @@ export function SettingsNativeSortTab() {
       patch.targetMode = 'all'
       patch.includeSubfolders = true
     }
+    else if (scope === 'selected-only') {
+      patch.targetMode = 'selected'
+      patch.includeSubfolders = false
+    }
     else {
       patch.targetMode = 'selected'
       patch.includeSubfolders = true
@@ -156,6 +193,11 @@ export function SettingsNativeSortTab() {
   }
 
   const needsFolderSelection = settings.scope !== 'all'
+
+  const pinnedTopText = (settings.pinnedTop ?? []).join(', ')
+  const pinnedBottomText = (settings.pinnedBottom ?? []).join(', ')
+  const parseIdList = (text: string): string[] =>
+    [...new Set(text.split(/[\s,]+/).map(s => s.trim()).filter(Boolean))]
 
   const runSort = async () => {
     setError('')
@@ -178,7 +220,8 @@ export function SettingsNativeSortTab() {
         sortCriteria: settings.sortCriteria,
         sortSelf: settings.sortSelf,
         sortMode: settings.sortMode,
-        randomSeed: settings.randomSeed,
+        // 隨機模式每次都用新 seed 洗牌（不固定）；實際排列已存於 job targets 供復原
+        randomSeed: settings.sortMode === 'random' ? undefined : settings.randomSeed,
         pinnedTop: settings.pinnedTop,
         pinnedBottom: settings.pinnedBottom,
         foldersFirst: settings.foldersFirst,
@@ -237,18 +280,20 @@ export function SettingsNativeSortTab() {
         ? (
             <>
               {/* 中斷工作橫幅（SW 休眠/重啟、外部變動、失敗） */}
-              {job && job.status !== 'completed' && (
+              {job && !(job.status === 'completed' && dismissedCompleted) && (
                 <section className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="min-w-0">
                       <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
-                        {job.kind === 'restore'
-                          ? job.status === 'active'
-                            ? t('nativeSortJobActiveRestore')
-                            : t('nativeSortJobPendingRestore')
-                          : job.status === 'active'
-                            ? t('nativeSortJobActiveSort')
-                            : t('nativeSortJobPendingSort')}
+                        {job.status === 'completed'
+                          ? t('nativeSortJobCompleted')
+                          : job.kind === 'restore'
+                            ? job.status === 'active'
+                              ? t('nativeSortJobActiveRestore')
+                              : t('nativeSortJobPendingRestore')
+                            : job.status === 'active'
+                              ? t('nativeSortJobActiveSort')
+                              : t('nativeSortJobPendingSort')}
                       </p>
                       <p className="mt-0.5 text-xs text-amber-800/80 dark:text-amber-200/80">
                         {job.status === 'awaiting-user'
@@ -257,7 +302,9 @@ export function SettingsNativeSortTab() {
                             ? t('nativeSortJobStoppedExternal')
                             : job.status === 'failed'
                               ? t('nativeSortFailed', { message: job.error ?? '' })
-                              : t('nativeSortJobProcessing')}
+                              : job.status === 'completed'
+                                ? t('nativeSortJobCompleted')
+                                : t('nativeSortJobProcessing')}
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-2">
@@ -286,17 +333,31 @@ export function SettingsNativeSortTab() {
                           {t('nativeSortJobRestore')}
                         </Button>
                       )}
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => {
-                          void nativeSortExecutor.discardJob()
-                        }}
-                      >
-                        <Trash2 className="mr-1.5 h-3.5 w-3.5" />
-                        {t('nativeSortJobDiscard')}
-                      </Button>
+                      {job.status === 'completed'
+                        ? (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => setDismissedCompleted(true)}
+                            >
+                              <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                              {t('nativeSortJobDismiss')}
+                            </Button>
+                          )
+                        : (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => {
+                                void nativeSortExecutor.discardJob()
+                              }}
+                            >
+                              <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                              {t('nativeSortJobDiscard')}
+                            </Button>
+                          )}
                     </div>
                   </div>
                 </section>
@@ -401,6 +462,124 @@ export function SettingsNativeSortTab() {
                     />
                   </div>
                 )}
+              </section>
+
+              {/* 排序模式：依規則 / 手動 / 隨機 */}
+              <section className="rounded-xl border border-border bg-muted/35 p-4">
+                <h3 className="text-sm font-semibold">{t('nativeSortModeTitle')}</h3>
+                <ToggleGroup
+                  type="single"
+                  value={settings.sortMode ?? 'criteria'}
+                  onValueChange={(value) => {
+                    if (value)
+                      update({ sortMode: value as NativeBookmarkSortSettings['sortMode'] })
+                  }}
+                  className="mt-3 grid grid-cols-3 gap-1"
+                >
+                  {SORT_MODE_OPTIONS.map(opt => (
+                    <ToggleGroupItem key={opt.value} value={opt.value} className="text-xs">
+                      {t(opt.labelKey)}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  {t(SORT_MODE_OPTIONS.find(o => o.value === (settings.sortMode ?? 'criteria'))?.hintKey ?? 'nativeSortModeCriteriaHint')}
+                </p>
+              </section>
+
+              {/* 置頂 / 置底 */}
+              <section className="rounded-xl border border-border bg-muted/35 p-4">
+                <h3 className="text-sm font-semibold">{t('nativeSortPinnedTitle')}</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {t('nativeSortPinnedDescription')}
+                </p>
+                <div className="mt-3 space-y-3">
+                  <label className="block">
+                    <span className="mb-1 block text-xs font-medium">{t('nativeSortPinnedTopLabel')}</span>
+                    <input
+                      type="text"
+                      value={pinnedTopText}
+                      placeholder={t('nativeSortPinnedTopPlaceholder')}
+                      onChange={e => update({ pinnedTop: parseIdList(e.target.value) })}
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="mb-1 block text-xs font-medium">{t('nativeSortPinnedBottomLabel')}</span>
+                    <input
+                      type="text"
+                      value={pinnedBottomText}
+                      placeholder={t('nativeSortPinnedBottomPlaceholder')}
+                      onChange={e => update({ pinnedBottom: parseIdList(e.target.value) })}
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+                    />
+                  </label>
+                </div>
+              </section>
+
+              {/* 資料夾獨立規則 */}
+              <section className="rounded-xl border border-border bg-muted/35 p-4">
+                <h3 className="text-sm font-semibold">{t('nativeSortFolderRulesTitle')}</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {t('nativeSortFolderRulesDescription')}
+                </p>
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                  <ToggleGroup
+                    type="single"
+                    value={ruleMode}
+                    onValueChange={(value) => {
+                      if (value)
+                        setRuleMode(value as NonNullable<NativeBookmarkSortSettings['sortMode']>)
+                    }}
+                    className="grid grid-cols-3 gap-1"
+                  >
+                    {SORT_MODE_OPTIONS.map(opt => (
+                      <ToggleGroupItem key={opt.value} value={opt.value} className="text-xs">
+                        {t(opt.labelKey)}
+                      </ToggleGroupItem>
+                    ))}
+                  </ToggleGroup>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setRulePickerOpen(true)}
+                  >
+                    <FolderTree className="mr-1.5 size-3.5" />
+                    {t('nativeSortAddFolderRule')}
+                  </Button>
+                </div>
+                {(settings.folderRules ?? []).length === 0
+                  ? (
+                      <p className="mt-3 text-xs text-muted-foreground">
+                        {t('nativeSortFolderRulesEmpty')}
+                      </p>
+                    )
+                  : (
+                      <ul className="mt-3 space-y-1.5">
+                        {(settings.folderRules ?? []).map(rule => (
+                          <li
+                            key={rule.folderId}
+                            className="flex items-center justify-between gap-2 rounded-md border border-border/50 bg-background/60 px-3 py-2"
+                          >
+                            <span className="min-w-0 truncate text-xs">
+                              {rule.folderId}
+                              {' · '}
+                              {t(SORT_MODE_OPTIONS.find(o => o.value === rule.rule.mode)?.labelKey ?? 'nativeSortModeCriteria')}
+                            </span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 px-2"
+                              onClick={() => removeFolderRule(rule.folderId)}
+                            >
+                              <Minus className="size-3.5" />
+                            </Button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
               </section>
 
               {/* 怎麼排（排序依據） */}
@@ -577,6 +756,15 @@ export function SettingsNativeSortTab() {
         onConfirm={handleIgnorePickerConfirm}
         titleKey="nativeSortExcludeFolders"
         descriptionKey="nativeSortExcludeFoldersDescription"
+      />
+
+      <BookmarkFolderPickerDialog
+        open={rulePickerOpen}
+        onOpenChange={setRulePickerOpen}
+        initialIds={(settings.folderRules ?? []).map(r => r.folderId)}
+        onConfirm={handleRulePickerConfirm}
+        titleKey="nativeSortFolderRulesTitle"
+        descriptionKey="nativeSortFolderRulesDescription"
       />
     </>
   )
