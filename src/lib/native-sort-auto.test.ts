@@ -225,3 +225,114 @@ describe('hQ-5 — 祖先 manual 規則繼承與忽略清單', () => {
     expect(h.session.get(PENDING)).toEqual([])
   })
 })
+
+/* ===================== D2 第二輪：selected-with-sub 範圍 ===================== */
+
+/** 三層樹：0 → p → sub → grand（用來驗證後代與忽略子樹） */
+const nestedTree: TreeNode[] = [
+  { id: '0', children: [{ id: 'p', children: [{ id: 'sub', children: [{ id: 'grand' }] }] }] },
+]
+
+async function drainMicrotasks(times = 12): Promise<void> {
+  for (let i = 0; i < times; i++)
+    await Promise.resolve()
+}
+
+describe('d2-r2-4 — selected-with-sub 自動排序範圍', () => {
+  it('selected-with-sub 的子資料夾事件能觸發排序', async () => {
+    installChrome(nestedTree)
+    setSettings({ scope: 'selected-with-sub', targetFolderIds: ['p'] })
+    const mod = await loadModule()
+    mod.registerNativeSortAutoListener()
+    h.listeners.created?.('x', { parentId: 'sub' })
+    await drainMicrotasks()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls.map(c => c.targetIds[0])).toEqual(['sub'])
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+
+  it('多層孫資料夾也能正確處理', async () => {
+    installChrome(nestedTree)
+    setSettings({ scope: 'selected-with-sub', targetFolderIds: ['p'] })
+    const mod = await loadModule()
+    mod.registerNativeSortAutoListener()
+    h.listeners.created?.('x', { parentId: 'grand' })
+    await drainMicrotasks()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls.map(c => c.targetIds[0])).toEqual(['grand'])
+  })
+
+  it('忽略資料夾及其後代不會被排序', async () => {
+    installChrome(nestedTree)
+    setSettings({ scope: 'selected-with-sub', targetFolderIds: ['p'], ignoreFolderIds: ['sub'] })
+    const mod = await loadModule()
+    mod.registerNativeSortAutoListener()
+    h.listeners.created?.('x', { parentId: 'grand' })
+    await drainMicrotasks()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(0)
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+
+  it('selected-only 不會擴大至子資料夾', async () => {
+    installChrome(nestedTree)
+    setSettings({ scope: 'selected-only', targetFolderIds: ['p'] })
+    const mod = await loadModule()
+    mod.registerNativeSortAutoListener()
+    h.listeners.created?.('x', { parentId: 'sub' })
+    await drainMicrotasks()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(0)
+  })
+
+  it('children-only 不處理指定資料夾本身，但處理其子資料夾', async () => {
+    installChrome(nestedTree)
+    setSettings({ scope: 'children-only', targetFolderIds: ['p'] })
+    const mod = await loadModule()
+    mod.registerNativeSortAutoListener()
+
+    h.listeners.created?.('x', { parentId: 'p' })
+    await drainMicrotasks()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(0)
+
+    h.listeners.created?.('x', { parentId: 'sub' })
+    await drainMicrotasks()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls.map(c => c.targetIds[0])).toEqual(['sub'])
+  })
+})
+
+describe('d2-r2-3 — Planner 與自動排序的規則繼承語意一致', () => {
+  const tree = [{ id: '0', children: [{ id: 'p', children: [{ id: 'f1' }] }] }]
+
+  it('inherit=true 的資料夾規則沿用祖先 manual（不得誤判為獨立覆寫）', async () => {
+    installChrome(tree)
+    setSettings({
+      targetFolderIds: ['f1'],
+      folderRules: [
+        { folderId: 'p', rule: { mode: 'manual', inherit: false } },
+        { folderId: 'f1', rule: { mode: 'criteria', inherit: true } },
+      ],
+    })
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(0)
+  })
+
+  it('ui 格式的獨立規則（inherit=false）可覆寫全局 manual', async () => {
+    installChrome(tree)
+    setSettings({
+      sortMode: 'manual',
+      targetFolderIds: ['f1'],
+      folderRules: [{ folderId: 'f1', rule: { mode: 'criteria', inherit: false } }],
+    })
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls.map(c => c.targetIds[0])).toEqual(['f1'])
+  })
+})

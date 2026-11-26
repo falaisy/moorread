@@ -37,7 +37,8 @@ export const chromeStorageAdapter: StorageAdapter = {
     chrome.storage.local.set({ [key]: value }),
   localRemove: (key: string): Promise<void> =>
     chrome.storage.local.remove(key),
-  localGetBytesInUse: (key: string): Promise<number> =>
+  localGetBytesInUse: (key: string | null): Promise<number> =>
+    // null → 整個 storage area 已使用位元組（配額估算需計入其他資料）
     chrome.storage.local.getBytesInUse(key),
   // 延遲求值：測試環境在 import 時 chrome 尚未存在，必須在實際存取時才讀取
   get localQuotaBytes(): number {

@@ -1,5 +1,6 @@
 import type { NativeSortCriterion } from './bookmark-native-sort'
 import type { BookmarkTreeNode } from './bookmark-tree'
+import type { SnapshotData } from './sort-types'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   compareNodes,
@@ -169,6 +170,10 @@ describe('deriveScopeFromLegacy', () => {
 
 interface FakeNode { id: string, title: string, url?: string, parentId?: string, index?: number }
 
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
 function inMemoryStorage() {
   const local: Record<string, unknown> = {}
   const session: Record<string, unknown> = {}
@@ -178,12 +183,12 @@ function inMemoryStorage() {
       const r: Record<string, unknown> = {}
       for (const k of ks) {
         if (k in store)
-          r[k] = store[k]
+          r[k] = structuredClone(store[k]) // Chrome 會複製資料，呼叫端不共享參考
       }
       return Promise.resolve(r)
     },
     set: (items: Record<string, unknown>) => {
-      for (const [k, v] of Object.entries(items)) store[k] = v
+      for (const [k, v] of Object.entries(items)) store[k] = structuredClone(v)
       return Promise.resolve()
     },
     remove: (keys: string | string[]) => {
@@ -191,12 +196,13 @@ function inMemoryStorage() {
       for (const k of ks) delete store[k]
       return Promise.resolve()
     },
-    getBytesInUse: (keys: string | string[]) => {
-      const ks = Array.isArray(keys) ? keys : [keys]
+    getBytesInUse: (keys: string | string[] | null) => {
+      // null → 整個 area 已使用位元組（UTF-8）
+      const ks = keys === null ? Object.keys(store) : (Array.isArray(keys) ? keys : [keys])
       let n = 0
       for (const k of ks) {
         if (k in store)
-          n += JSON.stringify(store[k]).length
+          n += utf8Bytes(JSON.stringify(store[k]))
       }
       return Promise.resolve(n)
     },
@@ -205,7 +211,18 @@ function inMemoryStorage() {
   return { local: area(local), session: area(session) }
 }
 
-function makeChromeMock(initial: Record<string, FakeNode[]>, failMoveIds: Set<string> = new Set()) {
+interface ChromeMockOptions {
+  /** onMoved 事件延遲（ms） */
+  eventDelayMs?: number
+  /** move API 延遲（ms），模擬執行中的 Chrome API 無法被強制中斷 */
+  moveDelayMs?: number
+}
+
+function makeChromeMock(
+  initial: Record<string, FakeNode[]>,
+  failMoveIds: Set<string> = new Set(),
+  options: ChromeMockOptions = {},
+) {
   const live: Record<string, FakeNode[]> = {}
   for (const [f, nodes] of Object.entries(initial))
     live[f] = nodes.map((n, i) => ({ ...n, index: i, parentId: f }))
@@ -213,6 +230,7 @@ function makeChromeMock(initial: Record<string, FakeNode[]>, failMoveIds: Set<st
   const moveLog: Array<{ id: string, parentId: string, index: number }> = []
   const movedListeners: Array<(id: string, info: { parentId: string, oldParentId: string, index: number, oldIndex: number }) => void> = []
   const noopEvent = { addListener: () => {}, removeListener: () => {}, hasListener: () => false }
+  const moveState = { inFlight: 0, maxInFlight: 0 }
 
   const bookmarks = {
     getTree: vi.fn(async () => {
@@ -228,16 +246,31 @@ function makeChromeMock(initial: Record<string, FakeNode[]>, failMoveIds: Set<st
       moveLog.push({ id, parentId: dest.parentId, index: dest.index })
       if (failMoveIds.has(id))
         throw new Error('move failed')
-      const list = live[dest.parentId]
-      const from = list.findIndex(n => n.id === id)
-      const oldIndex = from
-      if (from !== -1) {
-        const [n] = list.splice(from, 1)
-        list.splice(dest.index, 0, { ...n, parentId: dest.parentId, index: dest.index })
+      moveState.inFlight++
+      moveState.maxInFlight = Math.max(moveState.maxInFlight, moveState.inFlight)
+      try {
+        if (options.moveDelayMs)
+          await new Promise(r => setTimeout(r, options.moveDelayMs))
+        const list = live[dest.parentId]
+        const from = list.findIndex(n => n.id === id)
+        const oldIndex = from
+        if (from !== -1) {
+          const [n] = list.splice(from, 1)
+          list.splice(dest.index, 0, { ...n, parentId: dest.parentId, index: dest.index })
+        }
+        // 模擬 Chrome 觸發 onMoved（向後搬 index 不位移）
+        const fire = () => {
+          for (const fn of [...movedListeners])
+            fn(id, { parentId: dest.parentId, oldParentId: dest.parentId, index: dest.index, oldIndex })
+        }
+        if (options.eventDelayMs)
+          setTimeout(fire, options.eventDelayMs)
+        else
+          fire()
       }
-      // 模擬 Chrome 觸發 onMoved（向後搬 index 不位移）
-      for (const fn of [...movedListeners])
-        fn(id, { parentId: dest.parentId, oldParentId: dest.parentId, index: dest.index, oldIndex })
+      finally {
+        moveState.inFlight--
+      }
       return {}
     }),
     onMoved: {
@@ -256,7 +289,7 @@ function makeChromeMock(initial: Record<string, FakeNode[]>, failMoveIds: Set<st
   bookmarks.onMoved.addListener((id, info) => {
     void handleBookmarkMoved(id, info)
   })
-  return { chromeMock, live, moveLog, failMoveIds }
+  return { chromeMock, live, moveLog, failMoveIds, moveState }
 }
 
 const titleAsc = [{ field: 'title' as const, direction: 'asc' as const }]
@@ -519,5 +552,119 @@ describe('restoreNativeBookmarks — 復原統計、原始快照保護與 awaiti
     const restored = await restoreNativeBookmarks()
     expect(restored.status).toBe('completed')
     expect(m.live.f.map(n => n.id)).toEqual(['z', 'a'])
+  })
+})
+
+/* ============ MR-261126-003-D2（第二輪）— 原始 Snapshot 保護與 restore 安全等待 ============ */
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms))
+}
+
+function sortF() {
+  return {
+    scope: 'selected-with-sub' as const,
+    targetFolderIds: ['f'],
+    ignoreFolderIds: [],
+    sortCriteria: titleAsc,
+    sortSelf: true,
+    recurse: false,
+  }
+}
+
+const threeUnsorted: FakeNode[] = [
+  { id: 'z', title: 'Zebra', url: 'https://z.co' },
+  { id: 'a', title: 'Alpha', url: 'https://a.co' },
+  { id: 'm', title: 'Mango', url: 'https://m.co' },
+]
+
+describe('d2-r2-1 — 原始 Snapshot 只在取得執行權後保存', () => {
+  it('活躍工作期間再次呼叫排序：被拒絕且原始 Snapshot 不變', async () => {
+    const m = makeChromeMock({ f: threeUnsorted.map(n => ({ ...n })) }, new Set(), { eventDelayMs: 60 })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    const first = sortNativeBookmarks(sortF())
+    await sleep(10)
+    const before = (await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY]
+    expect(before).toBeTruthy()
+
+    await expect(sortNativeBookmarks(sortF())).rejects.toThrow(/already in progress/)
+
+    const after = (await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY]
+    expect(after).toEqual(before)
+    expect((await first).status).toBe('completed')
+  })
+
+  it('手動排序事件後的自動排序 no-op：原始 Snapshot 仍是排序前狀態', async () => {
+    const m = makeChromeMock({ f: threeUnsorted.map(n => ({ ...n })) })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    const first = await sortNativeBookmarks(sortF())
+    expect(first.status).toBe('completed')
+    expect(m.live.f.map(n => n.id)).toEqual(['a', 'm', 'z'])
+    const before = (await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY] as SnapshotData
+    expect(before.folderOrders.f).toEqual(['z', 'a', 'm'])
+
+    // 排序引擎自己的 onMoved 事件會觸發自動排序 → 對已排序資料夾是 no-op
+    const second = await sortNativeBookmarks(sortF())
+    expect(second.status).toBe('completed')
+    expect(m.moveLog).toHaveLength(2) // 只有第一次排序的兩筆
+
+    const after = (await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY]
+    expect(after).toEqual(before)
+  })
+
+  it('自動排序的 no-op 不建立也不覆寫原始 Snapshot', async () => {
+    const m = makeChromeMock({
+      f: [
+        { id: 'a', title: 'Alpha', url: 'u' },
+        { id: 'm', title: 'Mango', url: 'u' },
+        { id: 'z', title: 'Zebra', url: 'u' },
+      ],
+    })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    const res = await sortNativeBookmarks(sortF())
+    expect(res.status).toBe('completed')
+    expect(m.moveLog).toHaveLength(0)
+    const stored = (await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY]
+    expect(stored).toBeUndefined()
+  })
+
+  it('snapshot 寫入失敗 → 工作 failed，且不執行任何 move', async () => {
+    const m = makeChromeMock({ f: threeUnsorted.map(n => ({ ...n })) })
+    const originalSet = m.chromeMock.storage.local.set
+    m.chromeMock.storage.local.set = (items: Record<string, unknown>) => {
+      if (SORT_SNAPSHOT_KEY in items)
+        return Promise.reject(new Error('quota exceeded'))
+      return originalSet(items)
+    }
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    const res = await sortNativeBookmarks(sortF())
+    expect(res.status).toBe('failed')
+    expect(res.error).toMatch(/quota/)
+    expect(m.moveLog).toHaveLength(0)
+    expect(m.live.f.map(n => n.id)).toEqual(['z', 'a', 'm'])
+  })
+})
+
+describe('d2-r2-2 — restore 等待目前工作到達安全停止點', () => {
+  it('move API 延遲時 restore 不與執行中的工作重疊，也不依賴固定延遲', async () => {
+    const m = makeChromeMock({ f: threeUnsorted.map(n => ({ ...n })) }, new Set(), { moveDelayMs: 100 })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    const first = sortNativeBookmarks(sortF())
+    await sleep(20) // 第一筆 move 正在延遲中（無法強制中斷）
+
+    const restored = await restoreNativeBookmarks()
+    const sortResult = await first
+
+    expect(sortResult.status).toBe('failed') // 取消 → 明確失敗，不虛報
+    expect(restored.status).toBe('completed')
+    // 兩個工作不得同時呼叫 move API（restore 等到安全停止點才開始）
+    expect(m.moveState.maxInFlight).toBe(1)
+    // 最終回到排序前順序
+    expect(m.live.f.map(n => n.id)).toEqual(['z', 'a', 'm'])
   })
 })

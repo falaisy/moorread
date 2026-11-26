@@ -349,28 +349,41 @@ export function orderFoldersPostOrder(folderIds: string[], idx: TreeIndex): stri
   })
 }
 
+/**
+ * 解析某資料夾實際適用的規則（統一的繼承語意，Planner 與自動排序共用）。
+ *
+ * - 明確設定在資料夾上的規則即為「獨立覆寫」（`inherit` 未指定或 false）。
+ *   舊設定遷移時沒有 inherit 欄位，仍必須有效 → 不可要求 inherit===false 才生效。
+ * - `inherit: true` 代表此資料夾宣告沿用祖先 → 跳過自己，繼續往上找覆寫。
+ * - 找不到任何覆寫 → 使用 defaultRule。
+ */
+export function resolveEffectiveRule(
+  folderId: string,
+  parentOf: Map<string, string | undefined>,
+  folderRules: Array<{ folderId: string, rule: NativeSortRule }> | undefined,
+  defaultRule: NativeSortRule,
+): NativeSortRule {
+  const ruleMap = new Map<string, NativeSortRule>()
+  for (const fr of folderRules ?? [])
+    ruleMap.set(fr.folderId, fr.rule)
+
+  let cur: string | undefined = folderId
+  while (cur) {
+    const r = ruleMap.get(cur)
+    if (r && r.inherit !== true)
+      return r
+    cur = parentOf.get(cur)
+  }
+  return defaultRule
+}
+
 /** 解析某資料夾實際適用的規則（繼承鏈：最近的覆寫祖先 → 預設規則） */
 export function resolveRuleForFolder(
   folderId: string,
   options: PlannerOptions,
   idx: TreeIndex,
 ): NativeSortRule {
-  const ruleMap = new Map<string, NativeSortRule>()
-  for (const fr of options.folderRules ?? [])
-    ruleMap.set(fr.folderId, fr.rule)
-
-  // 從自己往上找第一個 inherit=false（獨立覆寫）的規則
-  let cur: string | undefined = folderId
-  while (cur) {
-    const r = ruleMap.get(cur)
-    if (r) {
-      if (r.inherit === false)
-        return r
-      // inherit===true（或未指定）：此資料夾宣告沿用，繼續往上找覆寫
-    }
-    cur = idx.parentOf.get(cur)
-  }
-  return options.defaultRule
+  return resolveEffectiveRule(folderId, idx.parentOf, options.folderRules, options.defaultRule)
 }
 
 /* -------------------------------------------------------------------------- */

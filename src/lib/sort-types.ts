@@ -31,7 +31,9 @@ export type NativeSortMode = 'criteria' | 'manual' | 'random'
  * - mode='random'：以 seed 決定固定目標順序（同一 job 重跑結果一致）
  *
  * pinnedTop / pinnedBottom 保留使用者指定的節點 id 與順序，不被其他規則破壞。
- * inherit=false 代表此資料夾獨立覆寫上層規則；預設 true（繼承）。
+ * 明確設定在資料夾上的規則即為獨立覆寫（inherit 未指定或 false）；
+ * inherit=true 代表宣告沿用最近祖先的覆寫規則（跳過自己）。
+ * Planner 與自動排序共用同一語意（resolveEffectiveRule）。
  */
 export interface NativeSortRule {
   mode: NativeSortMode

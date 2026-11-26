@@ -128,7 +128,8 @@ export function SettingsNativeSortTab() {
     const existing = (settings.folderRules ?? []).filter(r => !ids.includes(r.folderId))
     const added = ids.map(id => ({
       folderId: id,
-      rule: { mode: ruleMode, criteria: ruleMode === 'criteria' ? settings.sortCriteria : [] },
+      // inherit:false = 真正的獨立覆寫；否則會沿用祖先規則而失去作用
+      rule: { mode: ruleMode, criteria: ruleMode === 'criteria' ? settings.sortCriteria : [], inherit: false },
     }))
     update({ folderRules: [...existing, ...added] })
   }

@@ -72,7 +72,8 @@ export interface StorageAdapter {
   localGet: <T>(key: string) => Promise<T | undefined>
   localSet: (key: string, value: unknown) => Promise<void>
   localRemove: (key: string) => Promise<void>
-  localGetBytesInUse: (key: string) => Promise<number>
+  /** key=null 表示整個 storage area 已使用位元組數（Chrome getBytesInUse(null)） */
+  localGetBytesInUse: (key: string | null) => Promise<number>
   localQuotaBytes: number
   sessionGet: <T>(key: string) => Promise<T | undefined>
   sessionSet: (key: string, value: unknown) => Promise<void>
@@ -114,6 +115,16 @@ interface Deps {
 export interface ExecutorResult {
   job: JobRecord
   completed: boolean
+}
+
+/** 啟動工作的掛鉤（接線層用） */
+export interface RunHooks {
+  /**
+   * 成功取得執行權（job 已持久化為 active）且確認有實際移動要做後呼叫。
+   * 用於保存「最初排序前 Snapshot」：被拒絕或 no-op 的工作不得覆寫它。
+   * 拋錯 → 工作立即 failed，且不得執行任何 move。
+   */
+  onAcquired?: () => Promise<void>
 }
 
 /* --------------------------------- 指紋 ---------------------------------- */
@@ -175,6 +186,16 @@ function newSessionId(): string {
   return `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+/** UTF-8 位元組數（Chrome storage 配額語意，不能用 String.length / UTF-16） */
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
+/** active / awaiting-user 之外都是終止狀態 */
+function isTerminalStatus(status: JobStatus): boolean {
+  return status !== 'active' && status !== 'awaiting-user'
+}
+
 function emptyStats(): Pick<
   JobRecord,
   'movedBookmarks' | 'movedFolders' | 'foldersProcessed' | 'verificationFailures' | 'skipped'
@@ -195,6 +216,10 @@ export class SortExecutor {
   private abortCtrl: AbortController | null = null
   /** 取消原因缓存，让等待中的协程能写入 status */
   private cancelReason: string | null = null
+  /** 目前執行中的 JobRecord（cancel 立即標記終止狀態，結果物件才看得到） */
+  private activeJobRef: JobRecord | null = null
+  /** 序列化所有狀態寫入：讀取-合併-寫入不可交錯，避免舊物件覆蓋新終止狀態 */
+  private writeChain: Promise<unknown> = Promise.resolve()
 
   constructor(private readonly deps: Deps) {}
 
@@ -209,15 +234,54 @@ export class SortExecutor {
     return job && typeof job === 'object' ? job : null
   }
 
-  private async saveJob(job: JobRecord): Promise<void> {
-    // 配額以 UTF-8 位元組計（Chrome storage quota 規範），不能用 String.length（UTF-16）
-    const serialized = JSON.stringify(job)
-    const estimate = new Blob([serialized]).size
-    const used = await this.deps.storage.localGetBytesInUse(JOB_STORAGE_KEY).catch(() => 0)
-    if (used + estimate > this.deps.storage.localQuotaBytes) {
+  /**
+   * 所有狀態寫入都經過這裡：串行化「讀取持久化副本 → 合併 → 寫入」，
+   * 讓 cancel()/markExternal()/continueJob() 不會交錯寫入而互相覆蓋。
+   */
+  private saveJob(job: JobRecord): Promise<void> {
+    const next = this.writeChain.then(() => this.writeJobNow(job))
+    this.writeChain = next.catch(() => undefined)
+    return next
+  }
+
+  private async writeJobNow(job: JobRecord): Promise<void> {
+    // 以持久化副本裁決，避免執行中的舊物件（仍為 active）覆蓋較新的終止狀態。
+    const merged = await this.mergeWithPersisted(job)
+    // 配額（Chrome 語意）：
+    //  - UTF-8 位元組，不可用 String.length。
+    //  - 寫入既有 JOB_STORAGE_KEY 會取代舊值 → 不可把新舊大小重複相加。
+    //  - 必須計入其他 storage 資料已用空間。
+    const estimate = utf8Bytes(JSON.stringify(merged))
+    const totalUsed = await this.deps.storage.localGetBytesInUse(null).catch(() => 0)
+    const previousJobBytes = await this.deps.storage.localGetBytesInUse(JOB_STORAGE_KEY).catch(() => 0)
+    if (totalUsed - previousJobBytes + estimate > this.deps.storage.localQuotaBytes)
       throw new Error('insufficient storage for sort job')
+    await this.deps.storage.localSet(JOB_STORAGE_KEY, merged)
+    // 讓呼叫端持有的物件同步為實際寫入的狀態（後續檢查點才會看到終止狀態）
+    Object.assign(job, merged)
+  }
+
+  /**
+   * 終止狀態單調性：同一 jobId 一旦持久化為終止狀態，較舊的 in-memory 物件
+   * 不得把它寫回 active / completed。新工作（不同 jobId，例如 restore）不受影響。
+   * pending 與 snapshot 一律保留，避免狀態競態遺失復原資訊。
+   */
+  private async mergeWithPersisted(job: JobRecord): Promise<JobRecord> {
+    const persisted = await this.loadJob()
+    if (!persisted || persisted.jobId !== job.jobId)
+      return job
+    if (isTerminalStatus(persisted.status)) {
+      return {
+        ...job,
+        status: persisted.status,
+        error: persisted.error ?? job.error,
+        externalDirty: job.externalDirty || persisted.externalDirty,
+        pending: job.pending ?? persisted.pending,
+      }
     }
-    await this.deps.storage.localSet(JOB_STORAGE_KEY, job)
+    if (persisted.externalDirty && !job.externalDirty)
+      return { ...job, externalDirty: true }
+    return job
   }
 
   private async clearJob(): Promise<void> {
@@ -291,22 +355,31 @@ export class SortExecutor {
       }
       // 同 id 但參數不符：可能是重複/延遲事件，先檢查 recentConfirmed
     }
-    // 2) 重複/延遲的已確認事件 → 忽略
+    // 2) 重複/延遲的已確認事件 → 忽略（必須核對全部四個欄位，避免誤吞使用者操作）
     const now = this.now()
     this.recentConfirmed = this.recentConfirmed.filter(e => now - e.ts < RECENT_CONFIRMED_TTL_MS)
     if (this.recentConfirmed.some(e =>
-      e.id === id && e.parentId === info.parentId && e.index === info.index)) {
+      e.id === id
+      && e.parentId === info.parentId
+      && e.oldIndex === info.oldIndex
+      && e.index === info.index)) {
       return
     }
-    // 3) 未知事件 → 外部變動
+    // 3) 未知事件：先判斷是否涉及本次排序範圍，範圍外不得中止目前工作
+    if (!this.scopeSet.has(info.parentId) && !this.scopeSet.has(info.oldParentId))
+      return
+    // 4) 範圍內的未知事件 → 外部變動
     await this.markExternal(job, `unexpected onMoved: ${id}`)
     if (head)
       head.reject('external')
   }
 
-  async onChildrenReordered(_id: string, _info: ReorderEventInfo): Promise<void> {
+  async onChildrenReordered(id: string, _info: ReorderEventInfo): Promise<void> {
     const job = await this.loadJob()
     if (!job || job.status !== 'active')
+      return
+    // 範圍外資料夾的重排不影響本次工作
+    if (!this.scopeSet.has(id))
       return
     await this.markExternal(job, 'onChildrenReordered')
     const head = this.expected[0]
@@ -366,7 +439,7 @@ export class SortExecutor {
     job.externalDirty = true
     job.status = 'stopped-external'
     job.error = reason
-    job.pending = null
+    // 保留 pending 供稽核／恢復資訊，不用狀態競態把它清掉
     await this.saveJob(job)
   }
 
@@ -412,17 +485,30 @@ export class SortExecutor {
   }
 
   /** 啟動排序工作 */
-  runSort(targets: TargetState[], snapshot: SnapshotData): Promise<ExecutorResult> {
+  runSort(targets: TargetState[], snapshot: SnapshotData, hooks?: RunHooks): Promise<ExecutorResult> {
     return this.preflightNoActive().then(() =>
-      this.enqueue(() => this.runJob('sort', targets, snapshot)),
+      this.enqueue(() => this.runJob('sort', targets, snapshot, hooks)),
     )
   }
 
   /** 啟動復原工作（獨立 job，有自己的 snapshot） */
-  runRestore(targets: TargetState[], snapshot: SnapshotData): Promise<ExecutorResult> {
+  runRestore(targets: TargetState[], snapshot: SnapshotData, hooks?: RunHooks): Promise<ExecutorResult> {
     return this.preflightNoActive().then(() =>
-      this.enqueue(() => this.runJob('restore', targets, snapshot)),
+      this.enqueue(() => this.runJob('restore', targets, snapshot, hooks)),
     )
+  }
+
+  /**
+   * 可靠等待目前執行鏈到達安全停止點（含 cancel 觸發後的協作式終止）。
+   * restore 以此取代固定延遲猜測，不強制中斷執行中的 Chrome API。
+   */
+  async whenIdle(): Promise<void> {
+    for (;;) {
+      const current = this.running
+      await current.catch(() => undefined)
+      if (current === this.running)
+        return
+    }
   }
 
   /** 立即檢查是否已有活躍工作，避免在無限等待的工作後面排隊 */
@@ -443,16 +529,63 @@ export class SortExecutor {
     kind: JobKind,
     targets: TargetState[],
     snapshot: SnapshotData,
+    hooks?: RunHooks,
   ): Promise<ExecutorResult> {
     const job = await this.createJob(kind, targets, snapshot)
+    // no-op（目標與現況相同）：不移動、不呼叫 onAcquired，
+    // 避免自動排序重複的 no-op 工作覆寫真正的原始 Snapshot。
+    if (!this.hasPendingWork(job)) {
+      job.status = 'completed'
+      job.pending = null
+      await this.saveJob(job)
+      return { job, completed: true }
+    }
+    if (hooks?.onAcquired) {
+      try {
+        await hooks.onAcquired()
+      }
+      catch (cause) {
+        // 原始 Snapshot 保存失敗 → 立即停止，且尚未執行任何 move
+        job.status = 'failed'
+        job.error = cause instanceof Error ? cause.message : 'cannot persist sort snapshot'
+        job.pending = null
+        await this.saveJob(job)
+        return { job, completed: false }
+      }
+    }
     return this.continueJob(job)
+  }
+
+  /** 目標順序與目前實際順序不同 → 需要移動 */
+  private hasPendingWork(job: JobRecord): boolean {
+    return job.targets.some((target) => {
+      const actual = this.orders.get(target.folderId) ?? []
+      if (actual.length !== target.order.length)
+        return true
+      return actual.some((id, index) => id !== target.order[index])
+    })
   }
 
   /** 從目前 cursor 繼續執行（共用於首次執行與 SW 恢復） */
   private async continueJob(job: JobRecord): Promise<ExecutorResult> {
+    // 讓 cancel() 能立即在同一個物件上標記終止狀態（結果與持久化都一致）
+    this.activeJobRef = job
+    try {
+      return await this.continueJobInner(job)
+    }
+    finally {
+      if (this.activeJobRef === job)
+        this.activeJobRef = null
+    }
+  }
+
+  private async continueJobInner(job: JobRecord): Promise<ExecutorResult> {
     // 每次進入執行階段都重置 abortCtrl；cancel 走它而不走 enqueue 排隊
     this.abortCtrl = new AbortController()
     this.cancelReason = null
+    // 預期事件是「本工作」的執行期狀態：新工作不得被前一個工作中斷後
+    // 遺留的預期事件干擾（否則本工作的事件會被誤判為未知/重複）。
+    this.expected = []
 
     this.setScopeFromSnapshot(job.snapshot)
     // 同步快取 orders（若空則重讀）；讀取失敗 → 工作立即失敗，不可偽裝
@@ -473,7 +606,7 @@ export class SortExecutor {
       if (this.abortCtrl?.signal.aborted) {
         job.status = 'failed'
         job.error = this.cancelReason ?? 'cancelled by user'
-        job.pending = null
+        // 保留 pending（未完成的那筆移動）供稽核與後續恢復
         await this.saveJob(job)
         return { job, completed: false }
       }
@@ -637,8 +770,14 @@ export class SortExecutor {
       const outcome = await this.waitForEvent(waiter)
 
       if (outcome === 'external') {
-        return 'stop' // 已由 markExternal 處理
+        // 取消/外部事件：這筆移動可能仍會在稍後送達 onMoved。
+        // 登記為已知引擎事件，避免下一個工作把它誤判成外部變動。
+        this.forgetExpected(waiter, true)
+        return 'stop' // 已由 markExternal 或 cancel 處理
       }
+      // matched 的項目已由 onMoved 移出；timeout 的項目也必須清掉，
+      // 但事件可能延遲到達 → 一併登記為已知事件。
+      this.forgetExpected(waiter, outcome === 'timeout')
 
       // 5. 必要時重新讀取 Chrome 實際資料；6. 指紋裁決
       const actualNow = await this.safeGetChildren(folderId)
@@ -699,6 +838,22 @@ export class SortExecutor {
       resolve: () => {},
       reject: () => {},
     })
+  }
+
+  /** 移出預期佇列；remember=true 時登記為已知事件（延遲或中斷後的自家事件） */
+  private forgetExpected(entry: ExpectedMove, remember: boolean): void {
+    this.expected = this.expected.filter(e => e !== entry)
+    if (remember) {
+      this.recentConfirmed.push({
+        id: entry.id,
+        parentId: entry.parentId,
+        oldIndex: entry.oldIndex,
+        index: entry.index,
+        ts: this.now(),
+        resolve: () => {},
+        reject: () => {},
+      })
+    }
   }
 
   private waitForEvent(entry: ExpectedMove): Promise<'matched' | 'external' | 'timeout'> {
@@ -875,11 +1030,21 @@ export class SortExecutor {
    * - 保存后即使 SW 休眠或重啟，仍可从 resumeAfterRestart 看到取消状态
    */
   async cancel(): Promise<void> {
-    // 同步触发 abort，让所有 async 检查点立即生效
+    // 同步觸發 abort，讓所有 async 檢查點立即生效
     this.cancelReason = 'cancelled by user'
+    // 執行中的工作物件先標記終止：即使協程稍後才保存，結果物件與持久化都是 failed
+    const active = this.activeJobRef
+    if (active && (active.status === 'active' || active.status === 'awaiting-user')) {
+      active.status = 'failed'
+      active.error = this.cancelReason
+    }
     this.abortCtrl?.abort()
-    // 立即保存取消状态（不走 enqueue，避免排队）
+    // 立即保存取消狀態（不走 enqueue，避免排隊）
     try {
+      if (active) {
+        await this.saveJob(active)
+        return
+      }
       const job = await this.loadJob()
       // active / awaiting-user 都視為可中止：awaiting-user 若被中止（例如使用者改選擇復原），
       // 必須標 failed 才能通過 restore 的 preflightNoActive，且不得虛報為完成。

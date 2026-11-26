@@ -21,32 +21,47 @@ import { captureSnapshot } from './sort-snapshot'
 
 /* ------------------------------ mock 基礎建設 ------------------------------ */
 
+function utf8(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
+/** 模擬 Chrome Storage：寫入/讀取都複製資料，呼叫端不可能拿到同一個物件參考 */
+function cloneValue<T>(value: T): T {
+  return structuredClone(value)
+}
+
 class MockStorage implements StorageAdapter {
   local = new Map<string, unknown>()
   session = new Map<string, unknown>()
   localQuotaBytes = 10 * 1024 * 1024
   async localGet<T>(k: string): Promise<T | undefined> {
-    return (this.local.has(k) ? this.local.get(k) : undefined) as T | undefined
+    return (this.local.has(k) ? cloneValue(this.local.get(k)) : undefined) as T | undefined
   }
 
   async localSet(k: string, v: unknown): Promise<void> {
-    this.local.set(k, v)
+    this.local.set(k, cloneValue(v))
   }
 
   async localRemove(k: string): Promise<void> {
     this.local.delete(k)
   }
 
-  async localGetBytesInUse(k: string): Promise<number> {
-    return this.local.has(k) ? JSON.stringify(this.local.get(k)).length : 0
+  async localGetBytesInUse(k: string | null): Promise<number> {
+    if (k === null) {
+      let total = 0
+      for (const v of this.local.values())
+        total += utf8(JSON.stringify(v))
+      return total
+    }
+    return this.local.has(k) ? utf8(JSON.stringify(this.local.get(k))) : 0
   }
 
   async sessionGet<T>(k: string): Promise<T | undefined> {
-    return (this.session.has(k) ? this.session.get(k) : undefined) as T | undefined
+    return (this.session.has(k) ? cloneValue(this.session.get(k)) : undefined) as T | undefined
   }
 
   async sessionSet(k: string, v: unknown): Promise<void> {
-    this.session.set(k, v)
+    this.session.set(k, cloneValue(v))
   }
 
   async sessionRemove(k: string): Promise<void> {
@@ -75,6 +90,10 @@ class MockBookmarks implements BookmarkAdapter {
 
   // 注入控制
   eventDelayMs = 0
+  moveDelayMs = 0
+  /** 同時進行中的 move API 數量（驗證 restore 不會與執行中的工作重疊） */
+  moveInFlight = 0
+  maxMoveInFlight = 0
   suppressEvents = false
   failMoveIds = new Set<string>()
   mismatchMoveIds = new Set<string>()
@@ -132,49 +151,69 @@ class MockBookmarks implements BookmarkAdapter {
   async move(id: string, dest: { parentId: string, index: number }): Promise<void> {
     if (this.hangMoveIds.has(id))
       return new Promise(() => {}) // 永遠不 resolve，模擬 SW 在 move 中被殺
-    if (this.failMoveIds.has(id))
-      throw new Error(`chrome move failed for ${id}`)
+    this.moveInFlight++
+    this.maxMoveInFlight = Math.max(this.maxMoveInFlight, this.moveInFlight)
+    try {
+      // 模擬 Chrome move API 延遲（取消不可強制中斷正在執行的 API）
+      if (this.moveDelayMs > 0)
+        await new Promise(r => setTimeout(r, this.moveDelayMs))
+      if (this.failMoveIds.has(id))
+        throw new Error(`chrome move failed for ${id}`)
 
-    const meta = this.meta.get(id)
-    if (!meta)
-      throw new Error('unknown node')
-    const srcFolder = meta.parentId
-    const srcList = this.children.get(srcFolder) ?? []
-    const from = srcList.indexOf(id)
-    if (from === -1)
-      throw new Error('node not in source folder')
+      const meta = this.meta.get(id)
+      if (!meta)
+        throw new Error('unknown node')
+      const srcFolder = meta.parentId
+      const srcList = this.children.get(srcFolder) ?? []
+      const from = srcList.indexOf(id)
+      if (from === -1)
+        throw new Error('node not in source folder')
 
-    // 套用 Chrome 移動語意（同層往前搬會 index-1）
-    srcList.splice(from, 1)
-    let insertIndex = dest.index
-    if (srcFolder === dest.parentId && from < dest.index)
-      insertIndex = dest.index - 1
-    const dstList = this.children.get(dest.parentId) ?? []
-    dstList.splice(insertIndex, 0, id)
-    meta.parentId = dest.parentId
-    this.children.set(srcFolder, srcList)
-    this.children.set(dest.parentId, dstList)
+      // 套用 Chrome 移動語意（同層往前搬會 index-1）
+      srcList.splice(from, 1)
+      let insertIndex = dest.index
+      if (srcFolder === dest.parentId && from < dest.index)
+        insertIndex = dest.index - 1
+      const dstList = this.children.get(dest.parentId) ?? []
+      dstList.splice(insertIndex, 0, id)
+      meta.parentId = dest.parentId
+      this.children.set(srcFolder, srcList)
+      this.children.set(dest.parentId, dstList)
 
-    const newIndex = dstList.indexOf(id)
-    if (!this.suppressEvents) {
-      const fire = () => {
-        let info: MoveEventInfo = {
-          parentId: dest.parentId,
-          oldParentId: srcFolder,
-          index: newIndex,
-          oldIndex: from,
+      const newIndex = dstList.indexOf(id)
+      if (!this.suppressEvents) {
+        const fire = () => {
+          let info: MoveEventInfo = {
+            parentId: dest.parentId,
+            oldParentId: srcFolder,
+            index: newIndex,
+            oldIndex: from,
+          }
+          if (this.mismatchMoveIds.has(id))
+            info = { ...info, index: info.index + 99 } // 參數不符
+          this.fire('moved', id, info)
+          if (this.duplicateMoveIds.has(id))
+            this.fire('moved', id, info) // 重複事件
         }
-        if (this.mismatchMoveIds.has(id))
-          info = { ...info, index: info.index + 99 } // 參數不符
-        this.fire('moved', id, info)
-        if (this.duplicateMoveIds.has(id))
-          this.fire('moved', id, info) // 重複事件
+        if (this.eventDelayMs > 0)
+          setTimeout(fire, this.eventDelayMs)
+        else
+          fire()
       }
-      if (this.eventDelayMs > 0)
-        setTimeout(fire, this.eventDelayMs)
-      else
-        fire()
     }
+    finally {
+      this.moveInFlight--
+    }
+  }
+
+  /** 直接觸發 onMoved（模擬使用者或延遲事件） */
+  emitMoved(id: string, info: MoveEventInfo): void {
+    this.fire('moved', id, info)
+  }
+
+  /** 直接觸發 onChildrenReordered */
+  emitReordered(id: string, childIds: string[] = []): void {
+    this.fire('reordered', id, { childIds })
   }
 
   // 外部操作模擬（直接改變樹並觸發事件，不登記預期事件）
@@ -700,6 +739,8 @@ describe('d2-1 — 最终验证失败 → 工作明確 failed，不可 completed
     job.status = 'awaiting-user'
     job.cursorFolderIndex = 0
     job.foldersProcessed = 0
+    // MockStorage 模擬 Chrome 的資料複製語意 → 必須明確寫回
+    await storage.localSet(JOB_STORAGE_KEY, job)
     // bookmarks 此时已经是 ['A', 'B']（正确顺序），所以 verifyFolder 不会新增 failures
     // 但 continueJob 循环结束后会检查 job.verificationFailures → 标 failed
 
@@ -821,6 +862,217 @@ describe('d2-HQ9 — 儲存配額估算使用 UTF-8 位元組數', () => {
     // sortNativeBookmarks 會保存 snapshot 到 storage（executor.createJob）
     // 配額 40 bytes 太小 → 抛错
     await expect(exec.runSort(planTargets(tree, ascTitle), snapshot)).rejects.toThrow(/insufficient storage/)
+  })
+})
+
+/* ===================== D2 第二輪：取消與外部事件競態 ===================== */
+describe('d2-r2-2 — 取消與外部事件競態（統一狀態寫入）', () => {
+  it('取消與 move API 同時進行：move 完成後仍是 failed，不得變回 active/completed', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'A', 'B'])
+    bookmarks.setFolder('1', ['C', 'A', 'B'])
+    bookmarks.moveDelayMs = 60 // Chrome API 不可被強制中斷
+    const exec = makeExecutor(bookmarks, storage, 30)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 15)) // move 進行中
+    await exec.cancel()
+    const result = await p
+    expect(result.completed).toBe(false)
+    expect(result.job.status).toBe('failed')
+    const persisted = (await storage.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    expect(persisted.status).toBe('failed')
+    expect(persisted.pending).toBeTruthy() // 保留 pending 供稽核
+  })
+
+  it('取消與 onMoved 事件同時進行：不得留下 active，也不得謊報 completed', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    bookmarks.suppressEvents = true
+    const exec = makeExecutor(bookmarks, storage, 40)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 5))
+    // 使用者在範圍內的同層移動（非預期事件）與 cancel 幾乎同時發生
+    bookmarks.emitMoved('A', { parentId: '1', oldParentId: '1', index: 1, oldIndex: 1 })
+    await exec.cancel()
+    const result = await p
+    expect(['failed', 'stopped-external']).toContain(result.job.status)
+    const persisted = (await storage.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    expect(['failed', 'stopped-external']).toContain(persisted.status)
+    expect(persisted.status).not.toBe('active')
+  })
+
+  it('外部事件與執行中的工作同時寫入：不得恢復 active', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    bookmarks.suppressEvents = true
+    const exec = makeExecutor(bookmarks, storage, 40)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 5))
+    bookmarks.emitReordered('1', ['A', 'B'])
+    const result = await p
+    expect(result.completed).toBe(false)
+    const persisted = (await storage.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    expect(persisted.status).toBe('stopped-external')
+    expect(persisted.externalDirty).toBe(true)
+  })
+})
+
+/* ===================== D2 第二輪：外部事件範圍判斷 ===================== */
+describe('d2-r2-5 — 外部事件範圍判斷', () => {
+  it('範圍外 onMoved 不會中止排序', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    bookmarks.setFolder('99', ['X', 'Y'])
+    bookmarks.suppressEvents = true
+    const exec = makeExecutor(bookmarks, storage, 40)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 5))
+    bookmarks.emitMoved('X', { parentId: '99', oldParentId: '99', index: 0, oldIndex: 1 })
+    const result = await p
+    expect(result.completed).toBe(true)
+  })
+
+  it('範圍外 onChildrenReordered 不會中止排序', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    bookmarks.setFolder('99', ['X', 'Y'])
+    bookmarks.suppressEvents = true
+    const exec = makeExecutor(bookmarks, storage, 40)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 5))
+    bookmarks.emitReordered('99', ['Y', 'X'])
+    const result = await p
+    expect(result.completed).toBe(true)
+  })
+
+  it('範圍內未知事件會安全停止', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    bookmarks.suppressEvents = true
+    const exec = makeExecutor(bookmarks, storage, 40)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 5))
+    bookmarks.emitMoved('ZZ', { parentId: '1', oldParentId: '1', index: 0, oldIndex: 0 })
+    const result = await p
+    expect(result.job.status).toBe('stopped-external')
+  })
+
+  it('同 id/parentId/index 但 oldIndex 不同：不得被誤判為重複事件', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    bookmarks.suppressEvents = true // 引擎事件不送達，靠逾時確認
+    const exec = makeExecutor(bookmarks, storage, 50)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    // A(2→0) 於 50ms 逾時確認；B 的移動在 50~100ms 之間
+    await new Promise(r => setTimeout(r, 70))
+    // 使用者對 A 的同層移動：index 相同、oldIndex 不同 → 不是重複事件
+    bookmarks.emitMoved('A', { parentId: '1', oldParentId: '1', index: 0, oldIndex: 0 })
+    const result = await p
+    expect(result.job.status).toBe('stopped-external')
+  })
+})
+
+/* ===================== D2 第二輪：配額估算 ===================== */
+describe('d2-r2-6 — 儲存配額估算（Chrome 語意）', () => {
+  /** 先跑一次（大配額）取得最終 JobRecord 大小 */
+  async function measureJobBytes(): Promise<number> {
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    const b = new MockBookmarks()
+    const s = new MockStorage()
+    b.setFolder('1', ['C', 'B', 'A'])
+    const res = await makeExecutor(b, s).runSort(planTargets(tree, ascTitle), snapshot)
+    expect(res.completed).toBe(true)
+    const job = (await s.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    return utf8(JSON.stringify(job))
+  }
+
+  function freshUnsorted(): { bookmarks: MockBookmarks, storage: MockStorage } {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    return { bookmarks, storage }
+  }
+
+  it('同一 JobRecord 多次更新不會誤判配額不足', async () => {
+    const bytes = await measureJobBytes()
+    const { bookmarks, storage } = freshUnsorted()
+    // 1.5 倍：舊算法（used + estimate 重複計同一份 job）會在第 2 次保存誤判
+    storage.localQuotaBytes = Math.floor(bytes * 1.5)
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    const res = await makeExecutor(bookmarks, storage).runSort(planTargets(tree, ascTitle), snapshot)
+    expect(res.completed).toBe(true)
+  })
+
+  it('其他 Key 已佔用空間時能正確判斷', async () => {
+    const bytes = await measureJobBytes()
+    const otherValue = 'x'.repeat(Math.ceil(bytes * 3))
+    const otherBytes = utf8(JSON.stringify(otherValue))
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+
+    // 正向：整體仍在配額內
+    const ok = freshUnsorted()
+    await ok.storage.localSet('moorread:other', otherValue)
+    ok.storage.localQuotaBytes = bytes + otherBytes + 500
+    const res = await makeExecutor(ok.bookmarks, ok.storage).runSort(planTargets(tree, ascTitle), snapshot)
+    expect(res.completed).toBe(true)
+
+    // 負向：其他 Key 佔用後超出配額 → 拒絕（只看單一 Key 的舊算法會誤放行）
+    const bad = freshUnsorted()
+    await bad.storage.localSet('moorread:other', otherValue)
+    bad.storage.localQuotaBytes = Math.floor((bytes + otherBytes) * 0.95)
+    const badExec = makeExecutor(bad.bookmarks, bad.storage)
+    await expect(badExec.runSort(planTargets(tree, ascTitle), snapshot))
+      .rejects
+      .toThrow(/insufficient storage/)
+  })
+
+  it('utf-8 中文內容計算正確（不可用字元數）', async () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `bm${i}`)
+    const children = ids.map((id, i) => ({
+      id,
+      title: `測試標題${'排序'.repeat(3)}${i}`,
+      url: `https://${id}.test`,
+      index: i,
+    }))
+    const tree: PlannerNode[] = [{ id: '0', title: 'root', children: [{ id: '1', title: 'folder', children }] }]
+    const snapshot = captureSnapshot(tree, ['1'])
+    const targets = planToTargets(buildSortPlan(tree, {
+      scope: 'selected-only',
+      targetFolderIds: ['1'],
+      ignoreFolderIds: [],
+      defaultRule: ascTitle,
+    }))
+
+    const b1 = new MockBookmarks()
+    b1.setFolder('1', ids)
+    const s1 = new MockStorage()
+    const first = await makeExecutor(b1, s1).runSort(targets, snapshot)
+    expect(first.completed).toBe(true)
+
+    const job = (await s1.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    const json = JSON.stringify(job)
+    const utf8Len = utf8(json)
+    const utf16Len = json.length
+    expect(utf8Len).toBeGreaterThan(utf16Len + 100) // 中文讓 UTF-8 明顯大於字元數
+
+    const b2 = new MockBookmarks()
+    b2.setFolder('1', ids)
+    const s2 = new MockStorage()
+    s2.localQuotaBytes = utf16Len + 50 // 只有用字元數估算才會通過
+    await expect(makeExecutor(b2, s2).runSort(targets, snapshot)).rejects.toThrow(/insufficient storage/)
   })
 })
 

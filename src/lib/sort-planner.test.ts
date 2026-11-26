@@ -204,6 +204,36 @@ describe('規則繼承與獨立覆寫', () => {
     expect(plan.folders.find(f => f.folderId === '31')!.rule.mode).toBe('random')
     expect(plan.folders.find(f => f.folderId === '32')!.rule.mode).toBe('manual') // 繼承 3
   })
+
+  it('由 ui 建立的規則（未帶 inherit 欄位）也必須真正覆寫', () => {
+    // 舊版／UI 建立的規則可能沒有 inherit 欄位 → 仍為獨立覆寫，不得被忽略
+    const plan = buildSortPlan(tree, {
+      scope: 'selected-with-sub',
+      targetFolderIds: ['3'],
+      ignoreFolderIds: [],
+      defaultRule,
+      folderRules: [
+        { folderId: '3', rule: { mode: 'manual' } },
+      ],
+    })
+    expect(plan.folders.find(f => f.folderId === '3')!.rule.mode).toBe('manual')
+    expect(plan.folders.find(f => f.folderId === '31')!.rule.mode).toBe('manual')
+  })
+
+  it('inherit=true 宣告沿用，不得當成獨立覆寫', () => {
+    const plan = buildSortPlan(tree, {
+      scope: 'selected-with-sub',
+      targetFolderIds: ['3'],
+      ignoreFolderIds: [],
+      defaultRule,
+      folderRules: [
+        { folderId: '3', rule: { mode: 'manual', inherit: false } },
+        { folderId: '31', rule: { mode: 'random', seed: 7, inherit: true } },
+      ],
+    })
+    // 31 宣告 inherit=true → 跳過自己，沿用 3 的 manual
+    expect(plan.folders.find(f => f.folderId === '31')!.rule.mode).toBe('manual')
+  })
 })
 
 describe('computeTargetOrder — 手動/隨機/置頂置底', () => {

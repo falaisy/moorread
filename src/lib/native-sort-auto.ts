@@ -16,6 +16,7 @@ import {
   normalizeSortCriteria,
   sortNativeBookmarks,
 } from './bookmark-native-sort'
+import { resolveEffectiveRule } from './sort-planner'
 import { createStoragePort } from './storage-port'
 import { STORAGE_KEYS } from './store-persistence'
 
@@ -76,50 +77,95 @@ async function loadSettings(): Promise<NativeBookmarkSortSettings | null> {
   }
 }
 
-/**
- * 該資料夾是否為手動模式（手動模式自動排完全不動，保留使用者原生順序）
- * HQ-5：必須沿祖先鏈檢查 manual 規則，正確處理規則繼承。
- */
-async function isManualFolder(folderId: string, settings: NativeBookmarkSortSettings): Promise<boolean> {
-  const globalMode = settings.sortMode ?? 'criteria'
-  if (globalMode === 'manual')
-    return true
-
-  // 建立 parentId 映射，沿祖先鏈查 folderRules
-  const parentMap = new Map<string, string | undefined>()
+/** 書籤樹的 parent 映射；讀不到時回傳 null（保守處理，不擴大範圍） */
+async function loadParentMap(): Promise<Map<string, string | undefined> | null> {
   try {
     const tree = await chrome.bookmarks.getTree()
-    const walk = (nodes: Array<{ id: string, parentId?: string }>, parentId: string | undefined): void => {
+    const map = new Map<string, string | undefined>()
+    const walk = (nodes: Array<{ id: string, children?: unknown }>, parentId: string | undefined): void => {
       for (const n of nodes) {
-        parentMap.set(n.id, parentId)
-        walk((n as { children?: Array<{ id: string, parentId?: string }> }).children ?? [], n.id)
+        map.set(n.id, parentId)
+        walk((n.children as Array<{ id: string, children?: unknown }> | undefined) ?? [], n.id)
       }
     }
     walk(tree, undefined)
+    return map
   }
   catch {
-    // 無法讀書籤樹 → 退回只查全局
-    return false
+    return null
   }
-
-  let cur: string | undefined = folderId
-  while (cur) {
-    const override = settings.folderRules?.find(r => r.folderId === cur)
-    if (override)
-      return override.rule.mode === 'manual'
-    cur = parentMap.get(cur)
-  }
-  return false
 }
 
-function isFolderAllowed(folderId: string, settings: NativeBookmarkSortSettings): boolean {
+/** 由最近的覆寫祖先決定模式；與 Planner 共用同一繼承語意 */
+function isManualFolder(
+  folderId: string,
+  settings: NativeBookmarkSortSettings,
+  parentOf: Map<string, string | undefined> | null,
+): boolean {
+  const globalMode = settings.sortMode ?? 'criteria'
+  if (!parentOf) {
+    // 無法取得祖先鏈：只看自己的明確覆寫，其餘沿用全局
+    const own = settings.folderRules?.find(r => r.folderId === folderId)
+    if (own !== undefined && own.rule.inherit !== true)
+      return own.rule.mode === 'manual'
+    return globalMode === 'manual'
+  }
+  // 全局模式即 defaultRule：資料夾的獨立覆寫仍可覆蓋它（與 Planner 一致）
+  const rule = resolveEffectiveRule(
+    folderId,
+    parentOf,
+    settings.folderRules,
+    { mode: globalMode, criteria: settings.sortCriteria },
+  )
+  return rule.mode === 'manual'
+}
+
+/**
+ * 該資料夾是否在本次排序範圍內（不因事件擴大使用者的選取範圍）：
+ *  - selected-only    只有指定資料夾本身
+ *  - selected-with-sub 指定資料夾及其所有未被忽略的後代
+ *  - children-only    指定資料夾的後代，不含指定資料夾本身
+ *  - all              全部（忽略清單與其整個子樹除外）
+ */
+function isFolderAllowed(
+  folderId: string,
+  settings: NativeBookmarkSortSettings,
+  parentOf: Map<string, string | undefined> | null,
+): boolean {
   if (!folderId)
     return false
-  if (settings.ignoreFolderIds.includes(folderId))
+  const ignored = new Set(settings.ignoreFolderIds)
+  const targets = new Set(settings.targetFolderIds)
+
+  // 自己或任何祖先是忽略資料夾 → 整個子樹排除
+  let cursor: string | undefined = folderId
+  while (cursor) {
+    if (ignored.has(cursor))
+      return false
+    cursor = parentOf?.get(cursor)
+  }
+
+  if (settings.scope === 'all')
+    return true
+  if (settings.scope === 'selected-only')
+    return targets.has(folderId)
+
+  // 目標資料夾的後代（parentOf 不可用時保守地只承認目標本身）
+  const hasTargetAncestor = (): boolean => {
+    let cur = parentOf?.get(folderId)
+    while (cur) {
+      if (targets.has(cur))
+        return true
+      cur = parentOf?.get(cur)
+    }
     return false
-  if (settings.scope !== 'all' && !settings.targetFolderIds.includes(folderId))
+  }
+  if (settings.scope === 'selected-with-sub')
+    return targets.has(folderId) || hasTargetAncestor()
+  // children-only：不含指定資料夾本身
+  if (targets.has(folderId))
     return false
-  return true
+  return hasTargetAncestor()
 }
 
 async function enqueue(folderIds: Array<string | undefined>): Promise<void> {
@@ -156,11 +202,20 @@ async function flush(): Promise<void> {
   flushing = true
   // 同一次 flush 內每個資料夾只嘗試一次，避免持續失敗者被無限快速重試
   const attempted = new Set<string>()
+  let treeUnavailable = false
   try {
     const settings = await loadSettings()
     if (!settings?.enabled || !settings.autoSort) {
       // 自動排關閉：清空佇列，避免遺留
       await writePending(new Set())
+      return
+    }
+
+    // 範圍／規則判斷需要祖先鏈（忽略子樹、selected-with-sub 後代、規則繼承）
+    const parentOf = await loadParentMap()
+    if (!parentOf) {
+      // 讀不到書籤樹 → 不猜測範圍、不刪佇列，等下一次事件再處理（避免熱迴圈）
+      treeUnavailable = true
       return
     }
 
@@ -181,8 +236,8 @@ async function flush(): Promise<void> {
       attempted.add(folderId)
 
       // HQ-5 + 範圍檢查
-      const manual = await isManualFolder(folderId, settings)
-      if (!isFolderAllowed(folderId, settings) || manual) {
+      const manual = isManualFolder(folderId, settings, parentOf)
+      if (!isFolderAllowed(folderId, settings, parentOf) || manual) {
         // 不處理的 folder：從 pending 移除（一次性決策）
         pending.delete(folderId)
         await writePending(pending)
@@ -219,11 +274,13 @@ async function flush(): Promise<void> {
   }
   finally {
     flushing = false
-    // 若 flush 期間又新增了尚未嘗試的資料夾，再排一次；
-    // 已嘗試但失敗者仍在 attempted，不會被立即重試。
-    const left = await readPending()
-    if ([...left].some(id => !attempted.has(id)))
-      scheduleFlush()
+    if (!treeUnavailable) {
+      // 若 flush 期間又新增了尚未嘗試的資料夾，再排一次；
+      // 已嘗試但失敗者仍在 attempted，不會被立即重試。
+      const left = await readPending()
+      if ([...left].some(id => !attempted.has(id)))
+        scheduleFlush()
+    }
   }
 }
 

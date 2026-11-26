@@ -253,7 +253,7 @@ function buildDefaultRule(options: NativeBookmarkSortOptions): NativeSortRule {
 /**
  * 批量排序 Chrome 原生書籤（新引擎入口）。
  * 失敗/外部變動/中斷時 status !== 'completed'，呼叫端不可宣稱成功。
- * 啟動前將原始 Snapshot 獨立保存到 SORT_SNAPSHOT_KEY，與 restore job 互不覆蓋。
+ * 原始 Snapshot 只在成功取得執行權後保存；restore job 與它分開保存、互不覆蓋。
  */
 export async function sortNativeBookmarks(
   options: NativeBookmarkSortOptions,
@@ -283,18 +283,21 @@ export async function sortNativeBookmarks(
   const scopeFolderIds = plan.folders.map(f => f.folderId)
   const snapshot = captureSnapshot(tree, scopeFolderIds)
 
-  // 缺陷 6：將最初排序前的 Snapshot 獨立保存，restore 不覆蓋此鍵。
-  // restore 成功或使用者明確放棄後才清除（由 discardJob 負責）。
-  if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-    try {
+  // 缺陷 1：原始 Snapshot 只能在「成功取得執行權且有實際移動」後保存。
+  //  - 已有工作 / 啟動失敗 → runSort 在 createJob 前被拒絕，不會呼叫 onAcquired。
+  //  - 自動排序的 no-op → executor 判定沒有移動，不會呼叫 onAcquired。
+  //  - 已存在原始 Snapshot（尚未 restore/discard）→ 保留最初的那份，不覆寫。
+  //  - 寫入失敗 → 拋錯讓 executor 立即 failed，且不執行任何 move。
+  const result = await nativeSortExecutor.runSort(targets, snapshot, {
+    onAcquired: async () => {
+      if (typeof chrome === 'undefined' || !chrome.storage?.local)
+        return
+      const existing = await chrome.storage.local.get(SORT_SNAPSHOT_KEY)
+      if (existing[SORT_SNAPSHOT_KEY])
+        return
       await chrome.storage.local.set({ [SORT_SNAPSHOT_KEY]: snapshot })
-    }
-    catch {
-      // 寫入失敗不阻止排序啟動：executor.createJob preflight 已配額檢查
-    }
-  }
-
-  const result = await nativeSortExecutor.runSort(targets, snapshot)
+    },
+  })
   return mapResult(result)
 }
 
@@ -314,8 +317,9 @@ export async function restoreNativeBookmarks(): Promise<NativeBookmarkRestoreRes
 
   // 先安全停可能正在進行的 sort job：cancel() 不走 enqueue，立即觸發協作式取消
   await nativeSortExecutor.cancel()
-  // 等待 enqueue 協調器讓 sort job 协程自然終止；restore 啟動前 preflightNoActive 會再檢查
-  await new Promise(r => setTimeout(r, 50))
+  // 可靠等待目前執行鏈到達安全停止點（含執行中的 move 完成後的狀態處理），
+  // 不用固定延遲猜測；restore 啟動前 preflightNoActive 會再檢查。
+  await nativeSortExecutor.whenIdle()
 
   // 缺陷 6：優先讀獨立的 SORT_SNAPSHOT_KEY（最初排序前快照），restore 完成前不清除
   let snapshot: SnapshotData | null = null
