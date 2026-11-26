@@ -8,7 +8,7 @@
 | --- | --- |
 | 擴充功能套件 | 以 `pnpm package` 產生的 0.1.12 套件 |
 | 商店截圖（1280×800，5 張） | `screenshots-1280x800\` |
-| 隱私權政策 | `privacy-policy.html`（已放上公開 HTTPS） |
+| 隱私權政策 | 正式網址：<https://falaisy.github.io/moorread/privacy/>（原始碼 `docs/privacy/index.html`，經 GitHub Pages 由 `/docs` 發布）；`store-listing/privacy-policy.html` 保留為導向該網址的轉址頁 |
 
 截圖順序：1 總覽 → 2 搜尋 → 3 書籤組 → 4 批次管理 → 5 工作台。
 
