@@ -1,3 +1,4 @@
+import type { NativeFolderRule, NativeSortMode, NativeSortScope } from './sort-types'
 import type {
   AppearanceSettings,
   AutoOrganizeRule,
@@ -21,7 +22,9 @@ import {
 import { normalizeAutoOrganizeRules } from './auto-organize'
 import {
   DEFAULT_SORT_CRITERIA,
+  deriveScopeFromLegacy,
   normalizeSortCriteria,
+  normalizeSortRule,
 } from './bookmark-native-sort'
 import { isVirtualCategoryId } from './default-data'
 import { normalizeIgnoredDomains } from './description-sync'
@@ -115,10 +118,12 @@ export const DEFAULT_SETTINGS: Settings = {
     enabled: false,
     autoSort: false,
     sortCriteria: [...DEFAULT_SORT_CRITERIA],
+    sortMode: 'criteria',
     scope: 'all',
     sortSelf: true,
     targetFolderIds: [],
     ignoreFolderIds: [],
+    foldersFirst: true,
   },
   gistBackup: {
     token: '',
@@ -216,39 +221,62 @@ export function normalizeSettings(settings?: Partial<Settings>): Settings {
         }
       }
 
-      // scope 遷移：新設直接用，舊設從 targetMode + includeSubfolders 推導
-      let scope: import('./types').NativeSortScope = 'all'
-      if (raw?.scope === 'all' || raw?.scope === 'selected-with-sub' || raw?.scope === 'children-only') {
-        scope = raw.scope
+      const sortSelf = raw?.sortSelf !== false
+
+      // scope 遷移：新設直接用（四選一），舊設從 targetMode + includeSubfolders 推導。
+      // 推導只縮小、不擴大範圍：selected + includeSubfolders=false → selected-only。
+      const validScopes = new Set<NativeSortScope>(['all', 'selected-only', 'selected-with-sub', 'children-only'])
+      let scope: NativeSortScope
+      if (raw?.scope && validScopes.has(raw.scope as NativeSortScope)) {
+        scope = raw.scope as NativeSortScope
       }
       else {
         const legacyMode = raw?.targetMode === 'selected' ? 'selected' : 'all'
         const legacySubs = raw?.includeSubfolders === true
-        if (legacyMode === 'all') {
-          scope = 'all'
-        }
-        else if (legacySubs) {
-          // 舊版 selected + 有遞迴 → 用 sortSelf 再細分
-          scope = raw?.sortSelf === false ? 'children-only' : 'selected-with-sub'
-        }
-        else {
-          // 舊版 selected + 無遞迴 → 預設用 selected-with-sub（最接近）
-          scope = 'selected-with-sub'
-        }
+        scope = deriveScopeFromLegacy(legacyMode, legacySubs)
       }
+      // sortSelf=false 且 scope 含自己 → 退為 children-only（縮小，不擴大）
+      if (scope === 'selected-with-sub' && !sortSelf)
+        scope = 'children-only'
+
+      // 新模式/置頂置底/種子/資料夾獨立規則：無效值採安全 fallback，不擴大範圍
+      const mode: NativeSortMode
+        = raw?.sortMode === 'manual' || raw?.sortMode === 'random' ? raw.sortMode : 'criteria'
+      const seed = typeof raw?.randomSeed === 'number' && Number.isFinite(raw.randomSeed) ? raw.randomSeed : undefined
+      const pinFilter = (v: unknown): string[] => Array.isArray(v)
+        ? v.filter((id): id is string => typeof id === 'string' && id.length > 0)
+        : []
+      const rawRules: unknown = raw?.folderRules
+      const folderRules: NativeFolderRule[] = Array.isArray(rawRules)
+        ? rawRules
+            .filter((r): r is Record<string, unknown> => r !== null && typeof r === 'object')
+            .map((r) => {
+              const folderId = r.folderId
+              return typeof folderId === 'string' && folderId.length > 0
+                ? { folderId, rule: normalizeSortRule(r.rule) }
+                : null
+            })
+            .filter((r): r is NativeFolderRule => r !== null)
+        : []
 
       return {
         enabled: raw?.enabled === true,
         autoSort: raw?.autoSort === true,
         sortCriteria: normalizeSortCriteria(criteria),
+        sortMode: mode,
         scope,
-        sortSelf: raw?.sortSelf !== false,
+        sortSelf,
         targetFolderIds: Array.isArray(raw?.targetFolderIds)
           ? raw.targetFolderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
           : [],
         ignoreFolderIds: Array.isArray(raw?.ignoreFolderIds)
           ? raw.ignoreFolderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
           : [],
+        ...(seed !== undefined ? { randomSeed: seed } : {}),
+        ...(raw?.pinnedTop != null ? { pinnedTop: pinFilter(raw.pinnedTop) } : {}),
+        ...(raw?.pinnedBottom != null ? { pinnedBottom: pinFilter(raw.pinnedBottom) } : {}),
+        foldersFirst: raw?.foldersFirst !== false,
+        ...(folderRules.length > 0 ? { folderRules } : {}),
         // 保留舊欄位（deprecated），雙寫確保降版不壞
         ...(raw?.targetMode != null ? { targetMode: raw.targetMode } : {}),
         ...(raw?.includeSubfolders != null ? { includeSubfolders: raw.includeSubfolders } : {}),

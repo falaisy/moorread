@@ -1,3 +1,13 @@
+// 排序子系統的共享型別以 sort-types.ts 為單一權威來源，此處匯入使用並重新匯出以方便外部引用。
+import type {
+  NativeFolderRule,
+  NativeSortCriterion,
+  NativeSortMode,
+  NativeSortScope,
+} from './sort-types'
+
+export type { NativeFolderRule, NativeSortCriterion, NativeSortMode, NativeSortScope }
+
 // 书签 —— 一个快捷网址入口
 export interface Bookmark {
   id: string
@@ -203,23 +213,16 @@ export interface HeaderWidgetSettings {
   weatherBackground: boolean
 }
 
-/** 原生書籤排序範圍：三選一，取代舊的 targetMode + includeSubfolders 兩個 boolean */
-export type NativeSortScope
-  = 'all' // 所有可寫資料夾（Chrome 內建根節點自動跳過）
-    | 'selected-with-sub' // 我選的資料夾 + 它們裡面全部子資料夾
-    | 'children-only' // 只排我選的資料夾裡面的子資料夾（本身不動）
-
 export interface NativeBookmarkSortSettings {
   /** 是否在设置页显示入口；关闭后不再渲染排序 Tab */
   enabled: boolean
   /** 启用后，每次新建或改名书签自动把其所在文件夹重排 */
   autoSort: boolean
   /** 多欄位排序鏈；依序 fallback，最後用原始 index 當穩定排序 tiebreaker */
-  sortCriteria: Array<{
-    field: 'title' | 'url' | 'dateAdded' | 'dateLastUsed'
-    direction: 'asc' | 'desc'
-  }>
-  /** 範圍三選一（讀舊版時從 targetMode + includeSubfolders 推導） */
+  sortCriteria: NativeSortCriterion[]
+  /** 排序模式：criteria（預設）/ manual（保留原生順序）/ random（固定 seed） */
+  sortMode?: NativeSortMode
+  /** 範圍四選一（讀舊版時從 targetMode + includeSubfolders 推導，不得擴大範圍） */
   scope?: NativeSortScope
   /** 同時排序目標資料夾本身；false 時只遞迴子資料夾（獨立於 scope） */
   sortSelf: boolean
@@ -227,6 +230,16 @@ export interface NativeBookmarkSortSettings {
   targetFolderIds: string[]
   /** 永遠不排這些資料夾（黑名單，不管什麼 scope 都會排除） */
   ignoreFolderIds: string[]
+  /** random 模式使用的固定種子（同一 job 重跑結果一致） */
+  randomSeed?: number
+  /** 置頂節點 id（保留順序，不被其他規則破壞） */
+  pinnedTop?: string[]
+  /** 置底節點 id */
+  pinnedBottom?: string[]
+  /** 資料夾優先（預設 true） */
+  foldersFirst?: boolean
+  /** 各資料夾獨立規則（inherit=false 覆寫上層） */
+  folderRules?: NativeFolderRule[]
   /** @deprecated 改用 scope；保留是為了舊版升級時不壞 */
   includeSubfolders?: boolean
   /** @deprecated 改用 scope；保留是為了舊版升級時不壞 */

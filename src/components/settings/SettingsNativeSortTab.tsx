@@ -1,8 +1,8 @@
-import type { NativeSortCriterion, NativeSortDirection, NativeSortField } from '~/lib/bookmark-native-sort'
+import type { JobRecord, NativeSortCriterion, NativeSortDirection, NativeSortField } from '~/lib/bookmark-native-sort'
 import type { MessageKey } from '~/lib/i18n'
 import type { NativeBookmarkSortSettings, NativeSortScope } from '~/lib/types'
-import { ArrowDownAZ, ArrowUpAZ, FolderTree, Minus, Play, Plus } from 'lucide-react'
-import { useState } from 'react'
+import { ArrowDownAZ, ArrowUpAZ, FolderTree, Minus, Play, Plus, RotateCcw, Trash2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { BookmarkFolderPickerDialog } from '~/components/settings/BookmarkFolderPickerDialog'
 import {
   AlertDialog,
@@ -17,7 +17,7 @@ import {
 import { Button } from '~/components/ui/button'
 import { Switch } from '~/components/ui/switch'
 import { ToggleGroup, ToggleGroupItem } from '~/components/ui/toggle-group'
-import { MAX_SORT_CRITERIA, sortNativeBookmarks } from '~/lib/bookmark-native-sort'
+import { MAX_SORT_CRITERIA, nativeSortExecutor, restoreNativeBookmarks, sortNativeBookmarks } from '~/lib/bookmark-native-sort'
 import { useNavStore } from '~/lib/store'
 import { useI18n } from '~/lib/use-i18n'
 
@@ -72,6 +72,25 @@ export function SettingsNativeSortTab() {
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [ignorePickerOpen, setIgnorePickerOpen] = useState(false)
+  const [job, setJob] = useState<JobRecord | null>(null)
+
+  // 輪詢執行器工作狀態（SW 休眠/重啟後的中斷工作需要讓使用者看見並處置）
+  useEffect(() => {
+    let cancelled = false
+    const refresh = async () => {
+      const j = await nativeSortExecutor.getJob()
+      if (!cancelled)
+        setJob(j)
+    }
+    void refresh()
+    const timer = window.setInterval(() => {
+      void refresh()
+    }, 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
 
   const update = (patch: Partial<NativeBookmarkSortSettings>) => {
     void setSettings(patch)
@@ -158,6 +177,12 @@ export function SettingsNativeSortTab() {
         ignoreFolderIds: settings.ignoreFolderIds,
         sortCriteria: settings.sortCriteria,
         sortSelf: settings.sortSelf,
+        sortMode: settings.sortMode,
+        randomSeed: settings.randomSeed,
+        pinnedTop: settings.pinnedTop,
+        pinnedBottom: settings.pinnedBottom,
+        foldersFirst: settings.foldersFirst,
+        folderRules: settings.folderRules,
       })
       const summary: SortRunResult = {
         foldersProcessed: res.foldersProcessed,
@@ -165,10 +190,14 @@ export function SettingsNativeSortTab() {
         movedFolders: res.movedFolders,
         skipped: res.skipped.length,
       }
-      // 原生順序核對失敗時不得顯示成功。
-      if (res.verificationFailures > 0) {
+      // 只有 status === 'completed' 才能宣稱成功；其餘一律顯示錯誤。
+      if (res.status !== 'completed') {
         setResult(null)
-        setError(t('nativeSortVerifyFailed', { folders: res.verificationFailures }))
+        const message = res.error
+          ?? (res.verificationFailures > 0
+            ? t('nativeSortVerifyFailed', { folders: res.verificationFailures })
+            : res.status)
+        setError(t('nativeSortFailed', { message }))
         return
       }
       setResult(summary)
@@ -207,6 +236,72 @@ export function SettingsNativeSortTab() {
       {settings.enabled
         ? (
             <>
+              {/* 中斷工作橫幅（SW 休眠/重啟、外部變動、失敗） */}
+              {job && job.status !== 'completed' && (
+                <section className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
+                        {job.kind === 'restore'
+                          ? job.status === 'active'
+                            ? t('nativeSortJobActiveRestore')
+                            : t('nativeSortJobPendingRestore')
+                          : job.status === 'active'
+                            ? t('nativeSortJobActiveSort')
+                            : t('nativeSortJobPendingSort')}
+                      </p>
+                      <p className="mt-0.5 text-xs text-amber-800/80 dark:text-amber-200/80">
+                        {job.status === 'awaiting-user'
+                          ? t('nativeSortJobAwaitingUser')
+                          : job.status === 'stopped-external'
+                            ? t('nativeSortJobStoppedExternal')
+                            : job.status === 'failed'
+                              ? t('nativeSortFailed', { message: job.error ?? '' })
+                              : t('nativeSortJobProcessing')}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {job.status === 'awaiting-user' && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => {
+                            void nativeSortExecutor.resumeAfterRestart()
+                          }}
+                        >
+                          <Play className="mr-1.5 h-3.5 w-3.5" />
+                          {t('nativeSortJobResume')}
+                        </Button>
+                      )}
+                      {job.status !== 'active' && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            void restoreNativeBookmarks()
+                          }}
+                        >
+                          <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+                          {t('nativeSortJobRestore')}
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => {
+                          void nativeSortExecutor.discardJob()
+                        }}
+                      >
+                        <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                        {t('nativeSortJobDiscard')}
+                      </Button>
+                    </div>
+                  </div>
+                </section>
+              )}
+
               {/* 排什麼（scope 三選一） */}
               <section className="rounded-xl border border-border bg-muted/35 p-4">
                 <h3 className="text-sm font-semibold">{t('nativeSortScopeTitle')}</h3>

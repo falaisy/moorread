@@ -1,413 +1,323 @@
-import type { BookmarkTreeNode } from './bookmark-tree'
+import type { ExecutorResult } from './sort-executor'
+import type { MoveStep } from './sort-snapshot'
+import type {
+  JobRecord,
+  JobStatus,
+  NativeFolderRule,
+  NativeSortCriterion,
+  NativeSortDirection,
+  NativeSortField,
+  NativeSortMode,
+  NativeSortRule,
+  NativeSortScope,
+  PlannerNode,
+  RestoreStats,
+} from './sort-types'
+import {
+  chromeBookmarkAdapter,
+  chromeStorageAdapter,
+  readPlannerTree,
+} from './sort-chrome-adapter'
+import { SortExecutor } from './sort-executor'
+/**
+ * 薄型入口與接線層（不是第四個核心模組）。
+ *
+ * 三個核心模組：
+ *   - sort-planner.ts   排序規則解析、範圍正規化、TargetState 計算
+ *   - sort-snapshot.ts  排序前快照、復原計畫、部分復原統計
+ *   - sort-executor.ts  唯一呼叫 chrome.bookmarks.move()，pending/指紋/事件核對/中斷恢復
+ *
+ * 這裡只做：
+ *   1. 重新匯出公開型別與純函式，保持現有呼叫端（native-sort-auto / store / UI / 測試）相容。
+ *   2. 把 chrome.* 包裝成 Executor 相依介面（sort-chrome-adapter）。
+ *   3. sortNativeBookmarks：讀樹 → Planner 算計畫 → Snapshot 存快照 → Executor 執行。
+ *   4. 暴露 executor 單例與 resume/discard/restore 給 background 與 UI 接線。
+ */
+import {
+  buildSortPlan,
+  compareNodes,
+  DEFAULT_SORT_CRITERIA,
+  deriveScopeFromLegacy,
+  MAX_SORT_CRITERIA,
+  normalizeSortCriteria,
+  normalizeSortRule,
+  planToTargets,
+} from './sort-planner'
+import {
+  buildRestorePlan,
+  captureSnapshot,
 
-import type { NativeSortScope } from './types'
+  planFolderMoves as planFolderMovesPure,
+} from './sort-snapshot'
 
-/** 排序維度 */
-export type NativeSortField = 'title' | 'url' | 'dateAdded' | 'dateLastUsed'
-
-/** 排序方向 */
-export type NativeSortDirection = 'asc' | 'desc'
-
-/** 單一排序依據 */
-export interface NativeSortCriterion {
-  field: NativeSortField
-  direction: NativeSortDirection
+// ---------------------------------------------------------------------------
+// 公開型別（重新匯出，保持向後相容）
+// ---------------------------------------------------------------------------
+export type {
+  JobRecord,
+  JobStatus,
+  NativeFolderRule,
+  NativeSortCriterion,
+  NativeSortDirection,
+  NativeSortField,
+  NativeSortMode,
+  NativeSortRule,
+  NativeSortScope,
 }
 
-/** 最多允許幾個依據（太多沒意義，Chrome 書籤同值的機率很低） */
-export const MAX_SORT_CRITERIA = 3
+export {
+  compareNodes,
+  DEFAULT_SORT_CRITERIA,
+  deriveScopeFromLegacy,
+  MAX_SORT_CRITERIA,
+  normalizeSortCriteria,
+  normalizeSortRule,
+}
 
-/** 預設排序依據（向後兼容 + 新安裝） */
-export const DEFAULT_SORT_CRITERIA: NativeSortCriterion[] = [
-  { field: 'title', direction: 'asc' },
-]
-
-/** 單個資料夾的排序配置 */
+/** 舊版單資料夾排序配置（保留以避免破壞既有型別引用） */
 export interface NativeFolderSortOptions {
   folderId: string
   sortCriteria: NativeSortCriterion[]
 }
 
-/** 全書籤樹批量排序配置 */
-export interface NativeBookmarkSortOptions {
-  /** 三選一範圍 */
-  scope: NativeSortScope
-  /** 我選的資料夾（scope !== 'all' 時生效） */
-  targetFolderIds: string[]
-  /** 要忽略的資料夾 id（黑名單，不管什麼 scope 都生效） */
-  ignoreFolderIds: string[]
-  sortCriteria: NativeSortCriterion[]
-  /** 同時排序目標資料夾本身；false 時只遞迴子資料夾（獨立於 scope） */
-  sortSelf: boolean
-  /**
-   * 覆寫 scope 的遞迴行為；預設 undefined 時三種 scope 都遞迴。
-   *  自動排（native-sort-auto.ts）傳 false，只排事件那層不鑽子資料夾。
-   */
-  recurse?: boolean
-}
-
-/** 從舊欄位推導 scope（舊版設定升級用） */
-export function deriveScopeFromLegacy(
-  targetMode: 'all' | 'selected',
-  includeSubfolders: boolean,
-): NativeSortScope {
-  if (targetMode === 'all')
-    return 'all'
-  // selected + includeSubfolders=true → children-only 或 self-and-children 取決於 sortSelf
-  // 但 sortSelf 是獨立開關，這裡只考慮 scope 三選一
-  return includeSubfolders ? 'selected-with-sub' : 'selected-with-sub'
-}
-
-/** 排序結果 */
-export interface NativeBookmarkSortResult {
-  /** 被移動的書籤總數 */
-  movedBookmarks: number
-  /** 被移動的子資料夾總數 */
-  movedFolders: number
-  /** 處理過的資料夾數 */
-  foldersProcessed: number
-  /** 排序後重新讀取原生順序仍與目標不符的資料夾數 */
-  verificationFailures: number
-  /** 被跳過的資料夾原因 */
-  skipped: Array<{ folderId: string, reason: string }>
-}
-
-/** 判斷某個欄位值是否為「缺失」（缺失值永遠排最後，與 direction 無關） */
-function isFieldMissing(field: NativeSortField, node: BookmarkTreeNode): boolean {
-  switch (field) {
-    case 'title':
-      return !(node.title ?? '').trim()
-    case 'url':
-      return !(node.url ?? '').trim()
-    case 'dateAdded':
-      return node.dateAdded == null
-    case 'dateLastUsed':
-      return node.dateLastUsed == null
-    default:
-      return false
-  }
-}
-
-/** 單一欄位比較（不處理資料夾 vs 書籤、不處理缺失值、不處理 direction） */
-function singleFieldCmp(
-  field: NativeSortField,
-  left: BookmarkTreeNode,
-  right: BookmarkTreeNode,
-): number {
-  switch (field) {
-    case 'title':
-      return (left.title ?? '').localeCompare(right.title ?? '', undefined, {
-        sensitivity: 'base',
-        numeric: true,
-      })
-    case 'url':
-      return (left.url ?? '').localeCompare(right.url ?? '', undefined, {
-        sensitivity: 'base',
-      })
-    case 'dateAdded':
-      return (left.dateAdded ?? 0) - (right.dateAdded ?? 0)
-    case 'dateLastUsed':
-      return (left.dateLastUsed ?? 0) - (right.dateLastUsed ?? 0)
-    default:
-      return 0
-  }
-}
-
-/** 多欄位鏈比較：依序跑每個 criterion，第一個非零就返回 */
-export function compareNodes(
-  sortCriteria: NativeSortCriterion[],
-): (left: BookmarkTreeNode, right: BookmarkTreeNode) => number {
-  return (left, right) => {
-    // 資料夾排在書籤前面（Chrome 預設習慣）
-    if (!left.url && right.url)
-      return -1
-    if (left.url && !right.url)
-      return 1
-
-    for (const criterion of sortCriteria) {
-      const leftMissing = isFieldMissing(criterion.field, left)
-      const rightMissing = isFieldMissing(criterion.field, right)
-      // 缺失值永遠排最後，不受 direction 翻轉
-      if (leftMissing && !rightMissing)
-        return 1
-      if (!leftMissing && rightMissing)
-        return -1
-
-      const rawCmp = singleFieldCmp(criterion.field, left, right)
-      if (rawCmp !== 0) {
-        const factor = criterion.direction === 'asc' ? 1 : -1
-        return rawCmp * factor
-      }
-    }
-
-    // 全部依據平手 → 穩定排序用 index
-    return (left.index ?? 0) - (right.index ?? 0)
-  }
-}
-
-/** 小延遲，避免 chrome.bookmarks.move 大量快速調用觸發限流 */
-function tick(): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, 15))
-}
-
-/**
- * 產生單一資料夾的移動計畫。
- *
- * Chrome 的 `bookmarks.move(id, { index })` 對「同層往前搬」會把落點算成 index-1
- * （實測：[A,B,C,D] move A index 3 → [B,C,A,D]），因此這裡只規劃「向後搬」：
- * 由左而右固定每個位置，把目標項目從目前位置搬到目標位置（from 必定大於 to），
- * 向後搬不受上述位移影響，執行後的實際順序與本地模型一致。
- */
+/** 單一步驟（向後搬） */
 export interface FolderMoveStep {
   id: string
   from: number
   to: number
 }
 
+/**
+ * 產生單一資料夾的移動計畫（接線層包裝，接受 {id}[] 以保持舊呼叫端相容）。
+ * 實作邏輯在 sort-snapshot.ts。
+ */
 export function planFolderMoves(
   children: Array<{ id: string }>,
   sorted: Array<{ id: string }>,
 ): FolderMoveStep[] {
-  const current = children.map(node => node.id)
-  const steps: FolderMoveStep[] = []
-  for (let to = 0; to < sorted.length; to++) {
-    const id = sorted[to].id
-    const from = current.indexOf(id)
-    // 找不到（已被外部刪除）或已在正確位置 → 不移動
-    if (from === -1 || from === to)
-      continue
-    steps.push({ id, from, to })
-    current.splice(from, 1)
-    current.splice(to, 0, id)
-  }
-  return steps
+  return planFolderMovesPure(
+    children.map(n => n.id),
+    sorted.map(n => n.id),
+  ) as MoveStep[] as FolderMoveStep[]
 }
 
-async function sortFolderChildren(
-  folderId: string,
-  sortCriteria: NativeSortCriterion[],
-): Promise<{
+// ---------------------------------------------------------------------------
+// 排序選項（在舊介面上擴充新欄位，全部選擇性，不破壞舊呼叫端）
+// ---------------------------------------------------------------------------
+export interface NativeBookmarkSortOptions {
+  /** 四選一範圍 */
+  scope: NativeSortScope
+  /** 我選的資料夾（scope !== 'all' 時生效） */
+  targetFolderIds?: string[]
+  /** 要忽略的資料夾 id（黑名單，不管什麼 scope 都生效） */
+  ignoreFolderIds?: string[]
+  sortCriteria: NativeSortCriterion[]
+  /** 同時排序目標資料夾本身；false 時只遞迴子資料夾（獨立於 scope） */
+  sortSelf?: boolean
+  /** 覆寫 scope 的遞迴行為；自動排傳 false，只排事件那層不鑽子資料夾 */
+  recurse?: boolean
+
+  // 以下為新引擎欄位（皆可省略，省略時走預設，不擴大範圍）
+  /** 排序模式：criteria（預設）/ manual / random */
+  sortMode?: NativeSortMode
+  /** random 模式使用的固定種子（同一 job 重跑結果一致） */
+  randomSeed?: number
+  /** 置頂節點 id（保留順序，不被其他規則破壞） */
+  pinnedTop?: string[]
+  /** 置底節點 id */
+  pinnedBottom?: string[]
+  /** 資料夾優先（預設 true） */
+  foldersFirst?: boolean
+  /** 各資料夾獨立規則（inherit=false 覆寫上層） */
+  folderRules?: NativeFolderRule[]
+}
+
+/** 排序結果 */
+export interface NativeBookmarkSortResult {
   movedBookmarks: number
   movedFolders: number
-  verified: boolean
+  foldersProcessed: number
+  verificationFailures: number
   skipped: Array<{ folderId: string, reason: string }>
-}> {
-  const skipped: Array<{ folderId: string, reason: string }> = []
-
-  let children: BookmarkTreeNode[]
-  try {
-    children = await chrome.bookmarks.getChildren(folderId)
-  }
-  catch {
-    skipped.push({ folderId, reason: 'cannot read folder' })
-    return { movedBookmarks: 0, movedFolders: 0, verified: false, skipped }
-  }
-
-  if (children.length < 2)
-    return { movedBookmarks: 0, movedFolders: 0, verified: true, skipped }
-
-  const sorted = [...children].sort(compareNodes(sortCriteria))
-  const steps = planFolderMoves(children, sorted)
-
-  let movedBookmarks = 0
-  let movedFolders = 0
-  let model = [...children]
-  for (const step of steps) {
-    const target = model.find(node => node.id === step.id)
-    if (!target)
-      continue
-
-    try {
-      await chrome.bookmarks.move(step.id, {
-        parentId: folderId,
-        index: step.to,
-      })
-      // 只有原生移動成功才計入，並依節點實際類型分開統計。
-      if (target.url)
-        movedBookmarks++
-      else
-        movedFolders++
-      model = model.filter(node => node.id !== step.id)
-      model.splice(step.to, 0, target)
-      await tick()
-    }
-    catch {
-      skipped.push({ folderId: step.id, reason: 'move failed' })
-    }
-  }
-
-  // 完成後以 Chrome 原生順序核對目標，不以內部模型宣稱成功。
-  let verified = false
-  try {
-    const actual = await chrome.bookmarks.getChildren(folderId)
-    verified = actual.length === sorted.length
-      && actual.every((node, index) => node.id === sorted[index].id)
-  }
-  catch {
-    verified = false
-  }
-  if (!verified)
-    skipped.push({ folderId, reason: 'order verification failed' })
-
-  return { movedBookmarks, movedFolders, verified, skipped }
+  /** 工作狀態：completed 才算成功；其餘不可宣稱成功 */
+  status: JobStatus
+  /** 失敗/停止原因（若有） */
+  error?: string
 }
 
-/** 收集所有可寫資料夾 */
-function collectWritableFolders(
-  nodes: BookmarkTreeNode[],
-  ignoreIds: Set<string>,
-  acc: string[] = [],
-): string[] {
-  for (const node of nodes) {
-    if (node.url)
-      continue
-    if (node.unmodifiable || ignoreIds.has(node.id))
-      continue
-    acc.push(node.id)
-    if (node.children?.length)
-      collectWritableFolders(node.children, ignoreIds, acc)
+/** 復原結果 */
+export interface NativeBookmarkRestoreResult {
+  status: JobStatus
+  stats: RestoreStats
+  skipped: Array<{ folderId: string, reason: string }>
+  error?: string
+}
+
+// ---------------------------------------------------------------------------
+// Executor 單例（程序內唯一；狀態靠 storage 持久化，SW 休眠可恢復）
+// ---------------------------------------------------------------------------
+export const nativeSortExecutor = new SortExecutor({
+  bookmarks: chromeBookmarkAdapter,
+  storage: chromeStorageAdapter,
+})
+
+/** 從 chrome 事件監聽器抽出 info 型別，避免依賴未匯出的內部名稱 */
+type MovedInfo = Parameters<Parameters<typeof chrome.bookmarks.onMoved.addListener>[0]>[1]
+type ReorderedInfo = Parameters<Parameters<typeof chrome.bookmarks.onChildrenReordered.addListener>[0]>[1]
+type ChangedInfo = Parameters<Parameters<typeof chrome.bookmarks.onChanged.addListener>[0]>[1]
+type CreatedInfo = Parameters<Parameters<typeof chrome.bookmarks.onCreated.addListener>[0]>[1]
+type RemovedInfo = Parameters<Parameters<typeof chrome.bookmarks.onRemoved.addListener>[0]>[1]
+
+/**
+ * 在 Service Worker 頂層同步註冊五個書籤事件監聽器，轉呼到 executor。
+ * 必須在 resumeOnStartup() 之前呼叫，才能在恢復移動時正確核對事件。
+ */
+export function registerSortExecutorListeners(): void {
+  if (typeof chrome === 'undefined' || !chrome.bookmarks)
+    return
+  chrome.bookmarks.onMoved.addListener((id, info) => {
+    void handleBookmarkMoved(id, info)
+  })
+  chrome.bookmarks.onChildrenReordered.addListener((id, info) => {
+    void handleBookmarkChildrenReordered(id, info)
+  })
+  chrome.bookmarks.onChanged.addListener((id, info) => {
+    void handleBookmarkChanged(id, info)
+  })
+  chrome.bookmarks.onCreated.addListener((id, info) => {
+    void handleBookmarkCreated(id, info)
+  })
+  chrome.bookmarks.onRemoved.addListener((id, info) => {
+    void handleBookmarkRemoved(id, info)
+  })
+}
+
+/** 把 Chrome 原生書籤事件轉呼到 executor（background 頂層同步註冊後呼叫） */
+export async function handleBookmarkMoved(id: string, info: MovedInfo): Promise<void> {
+  await nativeSortExecutor.onMoved(id, {
+    parentId: info.parentId,
+    oldParentId: info.oldParentId,
+    index: info.index,
+    oldIndex: info.oldIndex,
+  })
+}
+export async function handleBookmarkChildrenReordered(id: string, info: ReorderedInfo): Promise<void> {
+  await nativeSortExecutor.onChildrenReordered(id, { childIds: info.childIds ?? [] })
+}
+export async function handleBookmarkChanged(id: string, info: ChangedInfo): Promise<void> {
+  await nativeSortExecutor.onChanged(id, { title: info.title, url: info.url })
+}
+export async function handleBookmarkCreated(id: string, info: CreatedInfo): Promise<void> {
+  await nativeSortExecutor.onCreated(id, { parentId: info.parentId ?? '', index: info.index })
+}
+export async function handleBookmarkRemoved(_id: string, info: RemovedInfo): Promise<void> {
+  await nativeSortExecutor.onRemoved(_id, {
+    parentId: info.parentId,
+    index: info.index,
+    node: {
+      id: info.node.id,
+      parentId: info.node.parentId,
+      index: info.node.index,
+      title: info.node.title,
+      url: info.node.url,
+    },
+  })
+}
+
+function mapResult(r: ExecutorResult): NativeBookmarkSortResult {
+  const j = r.job
+  return {
+    movedBookmarks: j.movedBookmarks,
+    movedFolders: j.movedFolders,
+    foldersProcessed: j.foldersProcessed,
+    verificationFailures: j.verificationFailures,
+    skipped: j.skipped,
+    status: j.status,
+    error: j.error,
   }
-  return acc
+}
+
+function buildDefaultRule(options: NativeBookmarkSortOptions): NativeSortRule {
+  return normalizeSortRule({
+    mode: options.sortMode ?? 'criteria',
+    criteria: options.sortCriteria,
+    foldersFirst: options.foldersFirst ?? true,
+    seed: options.randomSeed,
+    pinnedTop: options.pinnedTop,
+    pinnedBottom: options.pinnedBottom,
+    inherit: true,
+  })
 }
 
 /**
- * 批量排序 Chrome 原生書籤。
- *
- * scope 三選一 + sortSelf 獨立開關的語義：
- *   scope='all'               → 所有可寫資料夾 + 遞迴子資料夾；頂層排不排自己看 sortSelf
- *   scope='selected-with-sub' → targetFolderIds + 遞迴子；頂層排不排自己看 sortSelf
- *   scope='children-only'     → targetFolderIds + 遞迴子；頂層 sortSelf 強制 false
- *
- * recurse 參數可覆寫：自動排傳 recurse=false，只排事件那層不鑽子。
+ * 批量排序 Chrome 原生書籤（新引擎入口）。
+ * 失敗/外部變動/中斷時 status !== 'completed'，呼叫端不可宣稱成功。
  */
 export async function sortNativeBookmarks(
   options: NativeBookmarkSortOptions,
 ): Promise<NativeBookmarkSortResult> {
-  if (typeof chrome === 'undefined' || !chrome.bookmarks) {
+  if (typeof chrome === 'undefined' || !chrome.bookmarks)
     throw new Error('bookmarks api unavailable')
-  }
 
-  const [tree] = await chrome.bookmarks.getTree()
+  const tree = await readPlannerTree()
+  const defaultRule = buildDefaultRule(options)
 
-  // 1. 決定頂層要處理哪些資料夾
-  let folderIds: string[]
-  if (options.scope === 'all') {
-    folderIds = collectWritableFolders(
-      tree.children ?? [],
-      new Set(options.ignoreFolderIds),
-    )
-  }
-  else {
-    folderIds = options.targetFolderIds
-  }
+  const plan = buildSortPlan(tree, {
+    scope: options.scope,
+    targetFolderIds: options.targetFolderIds ?? [],
+    ignoreFolderIds: options.ignoreFolderIds ?? [],
+    defaultRule,
+    folderRules: options.folderRules,
+    sortSelf: options.sortSelf,
+    recurse: options.recurse,
+  })
 
-  // 2. children-only 強制不排自己
-  const shouldSortSelf = options.scope === 'children-only'
-    ? false
-    : options.sortSelf
+  const targets = planToTargets(plan)
+  const scopeFolderIds = plan.folders.map(f => f.folderId)
+  const snapshot = captureSnapshot(tree, scopeFolderIds)
 
-  // 3. 遞迴：scope 三選一預設都遞迴；recurse 參數可覆寫
-  const shouldRecurse = options.recurse !== false
-
-  const rootResult: NativeBookmarkSortResult = {
-    movedBookmarks: 0,
-    movedFolders: 0,
-    foldersProcessed: 0,
-    verificationFailures: 0,
-    skipped: [],
-  }
-
-  for (const folderId of folderIds) {
-    if (shouldSortSelf) {
-      const { movedBookmarks, movedFolders, verified, skipped } = await sortFolderChildren(
-        folderId,
-        options.sortCriteria,
-      )
-
-      rootResult.foldersProcessed++
-      rootResult.movedBookmarks += movedBookmarks
-      rootResult.movedFolders += movedFolders
-      if (!verified)
-        rootResult.verificationFailures++
-      rootResult.skipped.push(...skipped)
-    }
-
-    if (shouldRecurse) {
-      try {
-        const children = await chrome.bookmarks.getChildren(folderId)
-        const subFolders = children
-          .filter(n => !n.url && !n.unmodifiable && !options.ignoreFolderIds.includes(n.id))
-          .map(n => n.id)
-
-        for (const subId of subFolders) {
-          const subResult = await sortNativeBookmarks({
-            ...options,
-            targetFolderIds: [subId],
-            // 遞迴時子資料夾一定排自己、一定遞迴
-            scope: 'selected-with-sub',
-            sortSelf: true,
-            recurse: true,
-          })
-          rootResult.movedBookmarks += subResult.movedBookmarks
-          rootResult.movedFolders += subResult.movedFolders
-          rootResult.foldersProcessed += subResult.foldersProcessed
-          rootResult.verificationFailures += subResult.verificationFailures
-          rootResult.skipped.push(...subResult.skipped)
-        }
-      }
-      catch {
-        rootResult.skipped.push({ folderId, reason: 'cannot read children' })
-      }
-    }
-  }
-
-  return rootResult
+  const result = await nativeSortExecutor.runSort(targets, snapshot)
+  return mapResult(result)
 }
 
 /**
- * 驗證並歸一化 sortCriteria：保證是陣列、每個元素都合法、長度 1~3。
- *  舊版設定存的是 `field + direction`（單一欄位），這裡也自動轉成單元素 array 對齊新格式。
+ * 依最近一次工作的快照執行安全復原（獨立 restore job，有自己的快照與中斷恢復）。
+ * 規則見 sort-snapshot.buildRestorePlan：已刪除不重建、父資料夾不存在跳過、
+ * 跨資料夾移動跳過、排序期間新增節點保留在尾端且相對順序不變。
  */
-export function normalizeSortCriteria(
-  raw: unknown,
-): NativeSortCriterion[] {
-  const FIELD_SET: ReadonlySet<string> = new Set<NativeSortField>([
-    'title',
-    'url',
-    'dateAdded',
-    'dateLastUsed',
-  ])
-  const DIRECTION_SET: ReadonlySet<string> = new Set<NativeSortDirection>(['asc', 'desc'])
+export async function restoreNativeBookmarks(): Promise<NativeBookmarkRestoreResult> {
+  if (typeof chrome === 'undefined' || !chrome.bookmarks)
+    throw new Error('bookmarks api unavailable')
 
-  if (Array.isArray(raw)) {
-    const cleaned = raw
-      .filter((item): item is Record<string, unknown> =>
-        item !== null && typeof item === 'object')
-      .map((item) => {
-        const field = item.field
-        const direction = item.direction
-        if (typeof field === 'string' && FIELD_SET.has(field)
-          && typeof direction === 'string' && DIRECTION_SET.has(direction)) {
-          return { field: field as NativeSortField, direction: direction as NativeSortDirection }
-        }
-        return null
-      })
-      .filter((c): c is NativeSortCriterion => c !== null)
-      .slice(0, MAX_SORT_CRITERIA)
+  const job = await nativeSortExecutor.getJob()
+  if (!job || !job.snapshot)
+    throw new Error('no snapshot to restore')
 
-    if (cleaned.length > 0)
-      return cleaned
-  }
-  // 舊版 fallback：{ field: 'dateAdded', direction: 'desc' } → [{ field, direction }]
-  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
-    const r = raw as Record<string, unknown>
-    const field = r.field
-    const direction = r.direction
-    if (typeof field === 'string' && FIELD_SET.has(field)
-      && typeof direction === 'string' && DIRECTION_SET.has(direction)) {
-      return [{ field: field as NativeSortField, direction: direction as NativeSortDirection }]
+  const tree = await readPlannerTree()
+
+  // 從目前實況樹建立 currentOrders（folderId -> 子節點 id 順序）
+  const currentOrders: Record<string, string[]> = {}
+  const indexTree = (nodes: PlannerNode[], parentId: string | undefined): void => {
+    const ids: string[] = []
+    for (const n of nodes) {
+      ids.push(n.id)
+      if (n.children?.length)
+        indexTree(n.children, n.id)
     }
+    if (parentId !== undefined)
+      currentOrders[parentId] = ids
   }
+  indexTree(tree, undefined)
 
-  return [...DEFAULT_SORT_CRITERIA]
+  const restore = buildRestorePlan(job.snapshot, currentOrders)
+  // restore job 自己的快照：排序（復原）前的目前狀態
+  const restoreSnapshot = captureSnapshot(tree, Object.keys(job.snapshot.folderOrders))
+
+  const result = await nativeSortExecutor.runRestore(restore.targets, restoreSnapshot)
+  return {
+    status: result.job.status,
+    stats: restore.stats,
+    skipped: restore.skipped,
+    error: result.job.error,
+  }
 }

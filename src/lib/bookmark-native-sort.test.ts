@@ -5,6 +5,7 @@ import {
   compareNodes,
   DEFAULT_SORT_CRITERIA,
   deriveScopeFromLegacy,
+  handleBookmarkMoved,
   MAX_SORT_CRITERIA,
 
   normalizeSortCriteria,
@@ -132,7 +133,7 @@ describe('normalizeSortCriteria', () => {
     ])
   })
 
-  it('caps to MAX_SORT_CRITERIA entries', () => {
+  it('caps to MAX_SORT_CRITERIA entries (cap raised to 4 so all fields combine)', () => {
     const raw: NativeSortCriterion[] = [
       { field: 'title', direction: 'asc' },
       { field: 'url', direction: 'asc' },
@@ -140,6 +141,7 @@ describe('normalizeSortCriteria', () => {
       { field: 'dateLastUsed', direction: 'asc' }, // 第 4 個
     ]
     expect(normalizeSortCriteria(raw)).toHaveLength(MAX_SORT_CRITERIA)
+    expect(MAX_SORT_CRITERIA).toBe(4)
   })
 
   it('returns DEFAULT_SORT_CRITERIA when array has no valid entries after filtering', () => {
@@ -154,13 +156,110 @@ describe('deriveScopeFromLegacy', () => {
     expect(deriveScopeFromLegacy('all', true)).toBe('all')
   })
 
-  it('returns selected-with-sub for selected mode', () => {
-    expect(deriveScopeFromLegacy('selected', false)).toBe('selected-with-sub')
+  it('returns selected-with-sub when includeSubfolders, selected-only otherwise (no scope expansion)', () => {
     expect(deriveScopeFromLegacy('selected', true)).toBe('selected-with-sub')
+    // includeSubfolders=false：使用者不要子資料夾，遷移不得擴大範圍 → selected-only
+    expect(deriveScopeFromLegacy('selected', false)).toBe('selected-only')
   })
 })
 
-describe('sortNativeBookmarks', () => {
+/* ----------------------- 新引擎整合測試的 in-memory chrome ----------------------- */
+
+interface FakeNode { id: string, title: string, url?: string, parentId?: string, index?: number }
+
+function inMemoryStorage() {
+  const local: Record<string, unknown> = {}
+  const session: Record<string, unknown> = {}
+  const area = (store: Record<string, unknown>) => ({
+    get: (keys: string | string[]) => {
+      const ks = Array.isArray(keys) ? keys : [keys]
+      const r: Record<string, unknown> = {}
+      for (const k of ks) {
+        if (k in store)
+          r[k] = store[k]
+      }
+      return Promise.resolve(r)
+    },
+    set: (items: Record<string, unknown>) => {
+      for (const [k, v] of Object.entries(items)) store[k] = v
+      return Promise.resolve()
+    },
+    remove: (keys: string | string[]) => {
+      const ks = Array.isArray(keys) ? keys : [keys]
+      for (const k of ks) delete store[k]
+      return Promise.resolve()
+    },
+    getBytesInUse: (keys: string | string[]) => {
+      const ks = Array.isArray(keys) ? keys : [keys]
+      let n = 0
+      for (const k of ks) {
+        if (k in store)
+          n += JSON.stringify(store[k]).length
+      }
+      return Promise.resolve(n)
+    },
+    QUOTA_BYTES: 10 * 1024 * 1024,
+  })
+  return { local: area(local), session: area(session) }
+}
+
+function makeChromeMock(initial: Record<string, FakeNode[]>, failMoveIds: Set<string> = new Set()) {
+  const live: Record<string, FakeNode[]> = {}
+  for (const [f, nodes] of Object.entries(initial))
+    live[f] = nodes.map((n, i) => ({ ...n, index: i, parentId: f }))
+
+  const moveLog: Array<{ id: string, parentId: string, index: number }> = []
+  const movedListeners: Array<(id: string, info: { parentId: string, oldParentId: string, index: number, oldIndex: number }) => void> = []
+  const noopEvent = { addListener: () => {}, removeListener: () => {}, hasListener: () => false }
+
+  const bookmarks = {
+    getTree: vi.fn(async () => {
+      const children = Object.entries(live).map(([fid, nodes]) => ({
+        id: fid,
+        title: fid,
+        children: nodes.map(n => ({ ...n })),
+      }))
+      return [{ id: '0', title: '', children }]
+    }),
+    getChildren: vi.fn(async (folderId: string) => (live[folderId] ?? []).map(n => ({ ...n }))),
+    move: vi.fn(async (id: string, dest: { parentId: string, index: number }) => {
+      moveLog.push({ id, parentId: dest.parentId, index: dest.index })
+      if (failMoveIds.has(id))
+        throw new Error('move failed')
+      const list = live[dest.parentId]
+      const from = list.findIndex(n => n.id === id)
+      const oldIndex = from
+      if (from !== -1) {
+        const [n] = list.splice(from, 1)
+        list.splice(dest.index, 0, { ...n, parentId: dest.parentId, index: dest.index })
+      }
+      // 模擬 Chrome 觸發 onMoved（向後搬 index 不位移）
+      for (const fn of [...movedListeners])
+        fn(id, { parentId: dest.parentId, oldParentId: dest.parentId, index: dest.index, oldIndex })
+      return {}
+    }),
+    onMoved: {
+      addListener: (fn: (id: string, info: { parentId: string, oldParentId: string, index: number, oldIndex: number }) => void) => movedListeners.push(fn),
+      removeListener: () => {},
+      hasListener: () => true,
+    },
+    onChildrenReordered: noopEvent,
+    onChanged: noopEvent,
+    onCreated: noopEvent,
+    onRemoved: noopEvent,
+  }
+
+  const chromeMock = { bookmarks, storage: inMemoryStorage() }
+  // 把原生 onMoved 接到 executor（模擬 background 頂層同步註冊）
+  bookmarks.onMoved.addListener((id, info) => {
+    void handleBookmarkMoved(id, info)
+  })
+  return { chromeMock, live, moveLog, failMoveIds }
+}
+
+const titleAsc = [{ field: 'title' as const, direction: 'asc' as const }]
+
+describe('sortNativeBookmarks (new engine wiring)', () => {
   it('throws when chrome bookmarks api is unavailable', async () => {
     vi.stubGlobal('chrome', undefined)
     await expect(sortNativeBookmarks({
@@ -172,89 +271,94 @@ describe('sortNativeBookmarks', () => {
     })).rejects.toThrow('bookmarks api unavailable')
   })
 
-  it('sorts children of a single writable folder', async () => {
-    const children: BookmarkTreeNode[] = [
-      node({ id: '1', title: 'Zebra', url: 'https://z.co', dateAdded: 300 }),
-      node({ id: '2', title: 'Alpha', url: 'https://a.co', dateAdded: 200 }),
-      node({ id: '3', title: 'Mango', url: 'https://m.co', dateAdded: 100 }),
-    ]
-
-    const moveCalls: Array<[string, { parentId: string, index: number }]> = []
-    const getTree = vi.fn(async () => [{
-      id: '0',
-      title: '',
-      children: [
-        { id: '1', title: '' },
-        { id: '2', title: 'Other', children: [] },
+  it('sorts a folder by title using only move(), preserving native ids', async () => {
+    const m = makeChromeMock({
+      f: [
+        { id: 'z', title: 'Zebra', url: 'https://z.co' },
+        { id: 'a', title: 'Alpha', url: 'https://a.co' },
+        { id: 'm', title: 'Mango', url: 'https://m.co' },
       ],
-    }])
-    const getChildren = vi.fn(async () => children)
-    const move = vi.fn(async (id, opts) => {
-      moveCalls.push([id, opts])
-      return { id, title: '', parentId: opts.parentId, index: opts.index }
     })
+    vi.stubGlobal('chrome', m.chromeMock)
 
-    vi.stubGlobal('chrome', {
-      bookmarks: { getTree, getChildren, move },
-    })
-
-    const result = await sortNativeBookmarks({
+    const res = await sortNativeBookmarks({
       scope: 'selected-with-sub',
-      targetFolderIds: ['2'],
+      targetFolderIds: ['f'],
       ignoreFolderIds: [],
-      sortCriteria: [{ field: 'title', direction: 'asc' }],
+      sortCriteria: titleAsc,
       sortSelf: true,
       recurse: false,
     })
 
-    expect(result.foldersProcessed).toBe(1)
-    expect(moveCalls.length).toBeGreaterThan(0)
-    expect(getChildren).toHaveBeenCalledWith('2')
+    expect(res.status).toBe('completed')
+    expect(m.live.f.map(n => n.id)).toEqual(['a', 'm', 'z'])
+    // 所有寫入都經過 move；沒有 delete/create
+    expect(m.chromeMock.bookmarks.move).toHaveBeenCalled()
+    expect(res.movedBookmarks).toBe(2)
   })
 
-  it('skips folders that cannot be read', async () => {
-    const getTree = vi.fn(async () => [
-      { id: '0', title: '', children: [] },
-    ])
-    const getChildren = vi.fn(async () => {
-      throw new Error('no permission')
+  it('sorts all writable folders (scope=all)', async () => {
+    const m = makeChromeMock({
+      f1: [{ id: 'b', title: 'B', url: 'u' }, { id: 'a', title: 'A', url: 'u' }],
+      f2: [{ id: 'y', title: 'Y', url: 'u' }, { id: 'x', title: 'X', url: 'u' }],
     })
+    vi.stubGlobal('chrome', m.chromeMock)
 
-    vi.stubGlobal('chrome', {
-      bookmarks: { getTree, getChildren, move: vi.fn() },
-    })
-
-    const result = await sortNativeBookmarks({
-      scope: 'selected-with-sub',
-      targetFolderIds: ['forbidden'],
+    const res = await sortNativeBookmarks({
+      scope: 'all',
+      targetFolderIds: [],
       ignoreFolderIds: [],
-      sortCriteria: DEFAULT_SORT_CRITERIA,
+      sortCriteria: titleAsc,
       sortSelf: true,
-      recurse: false,
     })
 
-    expect(result.skipped).toContainEqual({ folderId: 'forbidden', reason: 'cannot read folder' })
+    expect(res.status).toBe('completed')
+    expect(m.live.f1.map(n => n.id)).toEqual(['a', 'b'])
+    expect(m.live.f2.map(n => n.id)).toEqual(['x', 'y'])
   })
 
-  it('skips folders with fewer than 2 children (no move needed)', async () => {
-    const getTree = vi.fn(async () => [{ id: '0', title: '', children: [] }])
-    const getChildren = vi.fn(async () => [node({ id: 'a', title: 'Only', url: 'https://x.co' })])
-
-    vi.stubGlobal('chrome', {
-      bookmarks: { getTree, getChildren, move: vi.fn() },
+  it('makes no moves and reports completed when already sorted', async () => {
+    const m = makeChromeMock({
+      f: [{ id: 'a', title: 'Alpha', url: 'u' }, { id: 'm', title: 'Mango', url: 'u' }, { id: 'z', title: 'Zebra', url: 'u' }],
     })
+    vi.stubGlobal('chrome', m.chromeMock)
 
-    const result = await sortNativeBookmarks({
+    const res = await sortNativeBookmarks({
       scope: 'selected-with-sub',
-      targetFolderIds: ['folder'],
+      targetFolderIds: ['f'],
       ignoreFolderIds: [],
-      sortCriteria: DEFAULT_SORT_CRITERIA,
+      sortCriteria: titleAsc,
       sortSelf: true,
       recurse: false,
     })
 
-    expect(result.movedBookmarks).toBe(0)
-    expect(getChildren).toHaveBeenCalledWith('folder')
+    expect(res.status).toBe('completed')
+    expect(m.moveLog).toHaveLength(0)
+    expect(res.movedBookmarks).toBe(0)
+  })
+
+  it('fail-stop: a move failure stops immediately and never claims success', async () => {
+    const order = [
+      { id: 'z', title: 'Zebra', url: 'u' },
+      { id: 'a', title: 'Alpha', url: 'u' },
+      { id: 'm', title: 'Mango', url: 'u' },
+    ]
+    const m = makeChromeMock({ f: order.map(n => ({ ...n })) }, new Set(['a', 'm', 'z']))
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    const res = await sortNativeBookmarks({
+      scope: 'selected-with-sub',
+      targetFolderIds: ['f'],
+      ignoreFolderIds: [],
+      sortCriteria: titleAsc,
+      sortSelf: true,
+      recurse: false,
+    })
+
+    // 失敗立即停止：只嘗試第一筆，後續預先計算的移動不執行
+    expect(res.status).not.toBe('completed')
+    expect(m.moveLog.length).toBeLessThanOrEqual(1)
+    expect(m.live.f.map(n => n.id)).toEqual(['z', 'a', 'm']) // 未被改動
   })
 })
 
@@ -318,152 +422,5 @@ describe('planFolderMoves', () => {
   it('ignores entries that no longer exist in the folder', () => {
     const steps = planFolderMoves(asNodes(['A', 'B']), asNodes(['B', 'A', 'gone']))
     expect(steps.every(step => step.id !== 'gone')).toBe(true)
-  })
-})
-
-describe('sortNativeBookmarks write-back', () => {
-  function statefulChrome(order: string[], failIds: Set<string> = new Set()) {
-    const ids: Record<string, string> = {}
-    for (const [i, title] of order.entries())
-      ids[title] = `id-${i}`
-    const moveCalls: Array<{ id: string, index: number, parentId: string }> = []
-    const live = [...order]
-    const chromeMock = {
-      bookmarks: {
-        getTree: vi.fn(async () => [{ id: '0', title: '', children: [{ id: 'folder', title: '', children: [] }] }]),
-        getChildren: vi.fn(async (folderId: string) =>
-          live.map((title, index) => node({ id: ids[title], title, url: `https://example.com/${title}`, index, parentId: folderId }))),
-        move: vi.fn(async (id: string, opts: { parentId: string, index: number }) => {
-          moveCalls.push({ id, index: opts.index, parentId: opts.parentId })
-          if (failIds.has(id))
-            throw new Error('move failed')
-          const from = live.findIndex(title => ids[title] === id)
-          const title = live[from]
-          live.splice(from, 1)
-          live.splice(opts.index > from ? opts.index - 1 : opts.index, 0, title)
-          return {}
-        }),
-      },
-    }
-    return { chromeMock, moveCalls, live, ids }
-  }
-
-  const options = {
-    scope: 'selected-with-sub' as const,
-    targetFolderIds: ['folder'],
-    ignoreFolderIds: [],
-    sortCriteria: [{ field: 'title' as const, direction: 'asc' as const }],
-    sortSelf: true,
-    recurse: false,
-  }
-
-  it('writes back the correct native order and counts only real moves', async () => {
-    const { chromeMock, live } = statefulChrome(['Zebra', 'Alpha', 'Mango'])
-    vi.stubGlobal('chrome', chromeMock)
-
-    const result = await sortNativeBookmarks(options)
-
-    expect(live).toEqual(['Alpha', 'Mango', 'Zebra'])
-    expect(result.movedBookmarks).toBe(2)
-    expect(result.skipped).toHaveLength(0)
-  })
-
-  it('does not move or report anything when the folder is already sorted', async () => {
-    const { chromeMock, moveCalls } = statefulChrome(['Alpha', 'Mango', 'Zebra'])
-    vi.stubGlobal('chrome', chromeMock)
-
-    const result = await sortNativeBookmarks(options)
-
-    expect(moveCalls).toHaveLength(0)
-    expect(result.movedBookmarks).toBe(0)
-    expect(result.movedFolders).toBe(0)
-  })
-
-  it('does not claim success when every move fails', async () => {
-    const order = ['Zebra', 'Alpha', 'Mango']
-    const { chromeMock, live, ids } = statefulChrome(order, new Set(['id-0', 'id-1', 'id-2']))
-    vi.stubGlobal('chrome', chromeMock)
-
-    const result = await sortNativeBookmarks(options)
-
-    expect(live).toEqual(order)
-    expect(result.movedBookmarks).toBe(0)
-    expect(result.movedFolders).toBe(0)
-    expect(result.verificationFailures).toBe(1)
-    expect(result.skipped).toContainEqual({ folderId: 'id-1', reason: 'move failed' })
-    expect(result.skipped).toContainEqual({ folderId: 'folder', reason: 'order verification failed' })
-    expect(ids).toBeTruthy()
-  })
-
-  it('counts only successful moves when one node cannot be moved (unmodifiable-like)', async () => {
-    const { chromeMock, live } = statefulChrome(['Zebra', 'Alpha', 'Mango'], new Set(['id-1']))
-    vi.stubGlobal('chrome', chromeMock)
-
-    const result = await sortNativeBookmarks(options)
-
-    // Alpha 無法移動；Mango 仍被搬到 index 1，最終順序核對失敗，不得回報整批成功
-    expect(result.skipped).toContainEqual({ folderId: 'id-1', reason: 'move failed' })
-    expect(result.movedBookmarks).toBe(1)
-    expect(result.verificationFailures).toBe(1)
-    expect(live).not.toEqual(['Alpha', 'Mango', 'Zebra'])
-  })
-
-  function statefulChromeMixed(nodes: Array<{ title: string, folder?: boolean }>) {
-    const ids: Record<string, string> = {}
-    for (const [i, n] of nodes.entries())
-      ids[n.title] = `id-${i}`
-    const kind: Record<string, boolean> = Object.fromEntries(nodes.map(n => [n.title, Boolean(n.folder)]))
-    const live = nodes.map(n => n.title)
-    const chromeMock = {
-      bookmarks: {
-        getTree: vi.fn(async () => [{ id: '0', title: '', children: [{ id: 'folder', title: '', children: [] }] }]),
-        getChildren: vi.fn(async (folderId: string) =>
-          live.map((title, index) => node({
-            id: ids[title],
-            title,
-            url: kind[title] ? undefined : `https://example.com/${title}`,
-            index,
-            parentId: folderId,
-          }))),
-        move: vi.fn(async (id: string, opts: { parentId: string, index: number }) => {
-          const from = live.findIndex(title => ids[title] === id)
-          const title = live[from]
-          live.splice(from, 1)
-          live.splice(opts.index > from ? opts.index - 1 : opts.index, 0, title)
-          return {}
-        }),
-      },
-    }
-    return { chromeMock, live }
-  }
-
-  it('counts folder moves in movedFolders only', async () => {
-    const { chromeMock, live } = statefulChromeMixed([
-      { title: 'Zeta', folder: true },
-      { title: 'Alpha', folder: true },
-    ])
-    vi.stubGlobal('chrome', chromeMock)
-
-    const result = await sortNativeBookmarks(options)
-
-    expect(live).toEqual(['Alpha', 'Zeta'])
-    expect(result.movedBookmarks).toBe(0)
-    expect(result.movedFolders).toBe(1)
-    expect(result.verificationFailures).toBe(0)
-  })
-
-  it('separates bookmark and folder counts when both move', async () => {
-    const { chromeMock, live } = statefulChromeMixed([
-      { title: 'Zulu' },
-      { title: 'AlphaFolder', folder: true },
-      { title: 'Beta' },
-    ])
-    vi.stubGlobal('chrome', chromeMock)
-
-    const result = await sortNativeBookmarks(options)
-
-    expect(live).toEqual(['AlphaFolder', 'Beta', 'Zulu'])
-    expect(result.movedBookmarks).toBe(1)
-    expect(result.movedFolders).toBe(1)
   })
 })

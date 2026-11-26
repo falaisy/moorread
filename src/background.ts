@@ -16,6 +16,10 @@ import {
   readAutoOrganizeSettings,
 } from '~/lib/auto-organize'
 import { registerBookmarkEvents } from '~/lib/bookmark-events'
+import {
+  nativeSortExecutor,
+  registerSortExecutorListeners,
+} from '~/lib/bookmark-native-sort'
 import { toNodeId } from '~/lib/bookmark-tree'
 import {
   normalizeBookmarkUrl,
@@ -51,7 +55,10 @@ import { translateRuntime } from '~/lib/i18n-runtime'
 import { loadPreferredLanguage } from '~/lib/language'
 import { LocalizedError } from '~/lib/localized-error'
 import { markLocalMetadataChanged } from '~/lib/metadata-sync'
-import { registerNativeSortAutoListener } from '~/lib/native-sort-auto'
+import {
+  registerNativeSortAutoListener,
+  resumeNativeSortAutoOnStartup,
+} from '~/lib/native-sort-auto'
 import {
   currentPageFromTab,
   getDuplicateBookmark,
@@ -901,5 +908,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   })
 })
 
+// Service Worker 頂層同步註冊書籤事件監聽器（Modern Web Guidance 要求）。
 registerBookmarkEvents()
 registerNativeSortAutoListener()
+registerSortExecutorListeners()
+// SW 啟動：自動檢查中斷的排序工作。session 標記存在＝SW 休眠可續跑；
+// 不存在＝瀏覽器重啟，僅標記 awaiting-user、不自行繼續，等待使用者確認。
+// 同時接續自動排的持久化待排佇列。
+void nativeSortExecutor.resumeOnStartup().catch(() => undefined)
+void resumeNativeSortAutoOnStartup().catch(() => undefined)

@@ -1,5 +1,10 @@
 import type { BookmarkGroup } from './bookmark-groups'
 import type {
+  NativeFolderRule,
+  NativeSortMode,
+  NativeSortScope,
+} from './sort-types'
+import type {
   BookmarkMeta,
   BookmarkUsage,
   Category,
@@ -9,7 +14,11 @@ import type {
 import { normalizeAppearanceSettings } from './appearance'
 import { normalizeAutoOrganizeRules } from './auto-organize'
 import { parseBookmarkGroup } from './bookmark-groups'
-import { normalizeSortCriteria } from './bookmark-native-sort'
+import {
+  deriveScopeFromLegacy,
+  normalizeSortCriteria,
+  normalizeSortRule,
+} from './bookmark-native-sort'
 import { getCategoryPath } from './category-path'
 import { getBrowserLanguage, isLanguage } from './i18n'
 import { normalizeKeyboardShortcuts } from './keyboard-shortcuts'
@@ -317,19 +326,54 @@ export function parseMoorreadBackup(raw: string): MoorreadBackup {
       keyboardShortcuts: normalizeKeyboardShortcuts(settings.keyboardShortcuts),
       nativeBookmarkSort: (() => {
         const raw = isRecord(settings.nativeBookmarkSort) ? settings.nativeBookmarkSort : undefined
+
+        // scope：優先保留新版四選一；否則從舊欄位推導（只縮小、不擴大）
+        const validScopes = new Set<NativeSortScope>(['all', 'selected-only', 'selected-with-sub', 'children-only'])
+        let scope: NativeSortScope
+        if (raw?.scope && validScopes.has(raw.scope as NativeSortScope))
+          scope = raw.scope as NativeSortScope
+        else
+          scope = deriveScopeFromLegacy(raw?.targetMode === 'selected' ? 'selected' : 'all', raw?.includeSubfolders === true)
+
+        const sortMode: NativeSortMode
+          = raw?.sortMode === 'manual' || raw?.sortMode === 'random' ? raw.sortMode : 'criteria'
+        const seed = typeof raw?.randomSeed === 'number' && Number.isFinite(raw.randomSeed) ? raw.randomSeed : undefined
+        const pinFilter = (v: unknown): string[] => Array.isArray(v)
+          ? v.filter((id): id is string => typeof id === 'string' && id.length > 0)
+          : []
+        const folderRules: NativeFolderRule[] = Array.isArray(raw?.folderRules)
+          ? raw.folderRules
+              .filter((r): r is Record<string, unknown> => r !== null && typeof r === 'object')
+              .map((r) => {
+                const folderId = r.folderId
+                return typeof folderId === 'string' && folderId.length > 0
+                  ? { folderId, rule: normalizeSortRule(r.rule) }
+                  : null
+              })
+              .filter((r): r is NativeFolderRule => r !== null)
+          : []
+
         return {
           enabled: raw?.enabled === true,
           autoSort: raw?.autoSort === true,
           sortCriteria: normalizeSortCriteria(raw?.sortCriteria),
-          includeSubfolders: raw?.includeSubfolders === true,
+          sortMode,
+          scope,
           sortSelf: raw?.sortSelf !== false,
-          targetMode: raw?.targetMode === 'selected' ? 'selected' : 'all',
           targetFolderIds: Array.isArray(raw?.targetFolderIds)
             ? raw.targetFolderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
             : [],
           ignoreFolderIds: Array.isArray(raw?.ignoreFolderIds)
             ? raw.ignoreFolderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
             : [],
+          ...(seed !== undefined ? { randomSeed: seed } : {}),
+          ...(raw?.pinnedTop != null ? { pinnedTop: pinFilter(raw.pinnedTop) } : {}),
+          ...(raw?.pinnedBottom != null ? { pinnedBottom: pinFilter(raw.pinnedBottom) } : {}),
+          foldersFirst: raw?.foldersFirst !== false,
+          ...(folderRules.length > 0 ? { folderRules } : {}),
+          // 保留舊欄位（deprecated），確保降版/舊備份往返不壞
+          includeSubfolders: raw?.includeSubfolders === true,
+          targetMode: raw?.targetMode === 'selected' ? 'selected' : 'all',
         }
       })(),
       gistBackup: (() => {

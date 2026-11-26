@@ -66,6 +66,20 @@ const zhTW = {
     '沒有符合條件的資料夾，或所有項目已在正確位置。',
   nativeSortWarning:
     '這會直接改變瀏覽器原生書籤的順序，無法復原。確認要執行嗎？',
+
+  // 中斷工作橫幅（SW 休眠/重啟、外部變動、失敗）
+  nativeSortJobActiveSort: '排序進行中…',
+  nativeSortJobActiveRestore: '復原進行中…',
+  nativeSortJobPendingSort: '偵測到未完成的排序工作',
+  nativeSortJobPendingRestore: '偵測到未完成的復原工作',
+  nativeSortJobAwaitingUser:
+    '瀏覽器重啟前有工作被中斷，請選擇繼續或復原到排序前。',
+  nativeSortJobStoppedExternal:
+    '排序期間偵測到外部變動，已安全停止並保留快照。',
+  nativeSortJobProcessing: '處理中，請稍候…',
+  nativeSortJobResume: '繼續',
+  nativeSortJobRestore: '復原快照',
+  nativeSortJobDiscard: '捨棄',
 }
 
 type NativeSortMessages = Record<keyof typeof zhTW, string>
@@ -132,6 +146,19 @@ const en: NativeSortMessages = {
     'No folders match, or every item is already in its correct position.',
   nativeSortWarning:
     'This directly reorders your browser’s native bookmarks and cannot be undone. Continue?',
+
+  nativeSortJobActiveSort: 'Sorting…',
+  nativeSortJobActiveRestore: 'Restoring…',
+  nativeSortJobPendingSort: 'An unfinished sort was detected',
+  nativeSortJobPendingRestore: 'An unfinished restore was detected',
+  nativeSortJobAwaitingUser:
+    'A job was interrupted before the browser restarted. Resume it or restore the pre-sort snapshot.',
+  nativeSortJobStoppedExternal:
+    'An external change was detected during sorting; stopped safely and the snapshot was kept.',
+  nativeSortJobProcessing: 'Processing, please wait…',
+  nativeSortJobResume: 'Resume',
+  nativeSortJobRestore: 'Restore snapshot',
+  nativeSortJobDiscard: 'Discard',
 }
 
 export const nativeSortMessages: Record<Language, NativeSortMessages> = {
