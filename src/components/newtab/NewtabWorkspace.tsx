@@ -56,6 +56,8 @@ interface DragSession {
   pointerId: number
   startX: number
   startWidth: number
+  dragStartWidth: number
+  startCollapsed: boolean
 }
 
 /** 首屏資料讀取失敗時顯示；不覆蓋既有書籤，提供明確重試入口。 */
@@ -137,6 +139,12 @@ export function NewtabWorkspace({
     if (kind === 'cancel') {
       localWidthRef.current = session.startWidth
       setDragWidth(session.startWidth)
+      if (session.startCollapsed) {
+        void setAppearance({
+          sidebarCollapsed: true,
+          sidebarWidth: session.startWidth,
+        })
+      }
     }
     else {
       const next = Math.round(localWidthRef.current)
@@ -158,7 +166,9 @@ export function NewtabWorkspace({
       sessionRef.current = {
         pointerId: event.pointerId,
         startX: event.clientX,
-        startWidth: SIDEBAR_WIDTH_DEFAULT,
+        startWidth: sidebarWidth,
+        dragStartWidth: SIDEBAR_WIDTH_DEFAULT,
+        startCollapsed: true,
       }
     }
     else {
@@ -168,6 +178,8 @@ export function NewtabWorkspace({
         pointerId: event.pointerId,
         startX: event.clientX,
         startWidth: sidebarWidth,
+        dragStartWidth: sidebarWidth,
+        startCollapsed: false,
       }
     }
     setIsDragging(true)
@@ -189,7 +201,7 @@ export function NewtabWorkspace({
       if (!session)
         return
       const delta = event.clientX - session.startX
-      const next = Math.round(session.startWidth + delta)
+      const next = Math.round(session.dragStartWidth + delta)
       localWidthRef.current = Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, next))
       setDragWidth(localWidthRef.current)
     }
