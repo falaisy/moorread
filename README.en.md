@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="./README.md">繁體中文</a> ·
-  <a href="./docs/en/privacy.en.md">Privacy</a> ·
+  <a href="https://falaisy.github.io/moorread/privacy/">Privacy</a> ·
   <a href="./LICENSE">License</a>
 </p>
 
@@ -89,7 +89,7 @@ Add an OpenAI-compatible base URL, token and model to generate a sorting preview
 
 No account and no analytics. Site icons request domains from Google Favicon when needed. Weather, page details, link checks, AI and WebDAV connect only when you use those features. WebDAV credentials and backup passphrases stay on this device.
 
-See [Privacy and permissions](./docs/en/privacy.en.md).
+See the [privacy policy](https://falaisy.github.io/moorread/privacy/).
 
 ## Development
 

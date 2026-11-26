@@ -11,7 +11,7 @@ Chrome 擴充功能（Manifest V3），把瀏覽器原生書籤變成可搜尋�
 - 品牌：書野 MoorRead（moor + read）。
 - 來源：MIT fork 自 `kiwiflydream/yunji-tab`，原作 © KIWI；修改 © 2026 falaisy。
 - 發行：Chrome Web Store 不公開（Unlisted），主要自用；商店連結 `https://chromewebstore.google.com/detail/eljjakdncoiphlbipgildicliklhmccl`。
-- 主 repo：`falaisy/moorread`（private）；隱私政策 repo：`falaisy/moorread-privacy`（public）。
+- 主 repo：`falaisy/moorread`（public）；隱私政策網站：`https://falaisy.github.io/moorread/privacy/`（原始碼在本 repo 的 `docs/privacy/`）。
 
 ## 2. 目標使用者與使用情境
 

@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="./README.en.md">English</a> ·
-  <a href="./docs/zh-TW/privacy.md">隱私</a> ·
+  <a href="https://falaisy.github.io/moorread/privacy/">隱私</a> ·
   <a href="./LICENSE">授權</a>
 </p>
 
@@ -91,7 +91,7 @@ pnpm build
 
 沒有帳號，沒有分析追蹤。網站圖示按需向 Google Favicon 傳送網域。天氣、網頁資訊、健康檢查、AI 與 WebDAV 只在使用對應功能時連線。WebDAV 帳密與備份口令只留在本機。
 
-完整說明見 [隱私與權限](./docs/zh-TW/privacy.md)。
+完整說明見 [隱私政策](https://falaisy.github.io/moorread/privacy/)。
 
 ## 開發
 
