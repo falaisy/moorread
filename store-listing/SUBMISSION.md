@@ -93,7 +93,7 @@ Put Chrome bookmarks back where you pass every day: search, save, sort and back 
 
 ## 六、隱私權政策網址
 
-<https://falaisy.github.io/moorread-privacy/>（原始碼：<https://github.com/falaisy/moorread-privacy>，僅含 `index.html`）。
+<https://falaisy.github.io/moorread/privacy/>（原始碼：<https://github.com/falaisy/moorread/tree/main/docs/privacy>，隨主 Repo 一起維護）。
 
 ## 七、送出後
 
