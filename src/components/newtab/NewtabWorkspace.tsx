@@ -108,17 +108,23 @@ export function NewtabWorkspace({
 
   const sidebarLayout = appearance.navLayout === 'sidebar'
   const sidebarVisible = sidebarLayout
-  const activeWidth = sidebarCollapsed ? SIDEBAR_WIDTH_COLLAPSED : sidebarWidth
+  const activeWidth = sidebarCollapsed
+    ? SIDEBAR_WIDTH_COLLAPSED
+    : isDragging ? dragWidth : sidebarWidth
 
   // --- Drag state -------------------------------------------------------
   const [isDragging, setIsDragging] = useState(false)
+  const [dragWidth, setDragWidth] = useState<number>(sidebarWidth)
   const localWidthRef = useRef<number>(sidebarWidth)
   const sessionRef = useRef<DragSession | null>(null)
   const handleElRef = useRef<HTMLButtonElement | null>(null)
 
   useEffect(() => {
-    localWidthRef.current = sidebarWidth
-  }, [sidebarWidth])
+    if (!isDragging) {
+      localWidthRef.current = sidebarWidth
+      setDragWidth(sidebarWidth)
+    }
+  }, [sidebarWidth, isDragging])
 
   const endDrag = useCallback((kind: 'commit' | 'cancel') => {
     const session = sessionRef.current
@@ -130,11 +136,14 @@ export function NewtabWorkspace({
     }
     catch { /* already released */ }
     if (kind === 'cancel') {
-      void setAppearance({ sidebarWidth: session.startWidth })
+      localWidthRef.current = session.startWidth
+      setDragWidth(session.startWidth)
     }
     else {
       const next = Math.round(localWidthRef.current)
       const clamped = Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, next))
+      localWidthRef.current = clamped
+      setDragWidth(clamped)
       void setAppearance({ sidebarWidth: clamped })
     }
     setIsDragging(false)
@@ -146,6 +155,7 @@ export function NewtabWorkspace({
     if (sidebarCollapsed) {
       void setAppearance({ sidebarCollapsed: false, sidebarWidth: SIDEBAR_WIDTH_DEFAULT })
       localWidthRef.current = SIDEBAR_WIDTH_DEFAULT
+      setDragWidth(SIDEBAR_WIDTH_DEFAULT)
       sessionRef.current = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -154,6 +164,7 @@ export function NewtabWorkspace({
     }
     else {
       localWidthRef.current = sidebarWidth
+      setDragWidth(sidebarWidth)
       sessionRef.current = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -181,7 +192,7 @@ export function NewtabWorkspace({
       const delta = event.clientX - session.startX
       const next = Math.round(session.startWidth + delta)
       localWidthRef.current = Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, next))
-      void setAppearance({ sidebarWidth: localWidthRef.current })
+      setDragWidth(localWidthRef.current)
     }
     const onUp = () => {
       endDrag('commit')
