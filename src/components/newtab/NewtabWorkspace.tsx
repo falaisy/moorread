@@ -119,7 +119,7 @@ export function NewtabWorkspace({
     : isDragging ? dragWidth : sidebarWidth
 
   useEffect(() => {
-    if (!isDragging) {
+    if (!isDragging && sidebarWidth !== localWidthRef.current) {
       localWidthRef.current = sidebarWidth
       setDragWidth(sidebarWidth)
     }
