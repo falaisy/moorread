@@ -108,16 +108,15 @@ export function NewtabWorkspace({
 
   const sidebarLayout = appearance.navLayout === 'sidebar'
   const sidebarVisible = sidebarLayout
-  const activeWidth = sidebarCollapsed
-    ? SIDEBAR_WIDTH_COLLAPSED
-    : isDragging ? dragWidth : sidebarWidth
-
   // --- Drag state -------------------------------------------------------
   const [isDragging, setIsDragging] = useState(false)
   const [dragWidth, setDragWidth] = useState<number>(sidebarWidth)
   const localWidthRef = useRef<number>(sidebarWidth)
   const sessionRef = useRef<DragSession | null>(null)
   const handleElRef = useRef<HTMLButtonElement | null>(null)
+  const activeWidth = sidebarCollapsed
+    ? SIDEBAR_WIDTH_COLLAPSED
+    : isDragging ? dragWidth : sidebarWidth
 
   useEffect(() => {
     if (!isDragging) {
