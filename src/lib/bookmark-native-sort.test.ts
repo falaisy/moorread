@@ -11,6 +11,7 @@ import {
 
   normalizeSortCriteria,
   planFolderMoves,
+  RANDOM_SEED_KEY,
   restoreNativeBookmarks,
   sortNativeBookmarks,
 } from './bookmark-native-sort'
@@ -498,7 +499,7 @@ describe('restoreNativeBookmarks — 復原統計、原始快照保護與 awaiti
     expect(snapAfter[SORT_SNAPSHOT_KEY]).toBeTruthy()
   })
 
-  it('已是最初順序時復原不移動任何節點', async () => {
+  it('已是最初順序時：no-op 不建立原始 Snapshot，restore 明確回報無可復原', async () => {
     const m = makeChromeMock({
       f: [
         { id: 'a', title: 'Alpha', url: 'https://a.co' },
@@ -507,7 +508,7 @@ describe('restoreNativeBookmarks — 復原統計、原始快照保護與 awaiti
     })
     vi.stubGlobal('chrome', m.chromeMock)
 
-    // 排序後仍為 a,z（本來就正確）
+    // 排序後仍為 a,z（本來就正確）→ no-op 不建立 baseline
     await sortNativeBookmarks({
       scope: 'selected-with-sub',
       targetFolderIds: ['f'],
@@ -516,10 +517,40 @@ describe('restoreNativeBookmarks — 復原統計、原始快照保護與 awaiti
       sortSelf: true,
       recurse: false,
     })
-    const restored = await restoreNativeBookmarks()
-    expect(restored.status).toBe('completed')
-    expect(restored.stats.restored).toBe(0)
+    expect((await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY]).toBeUndefined()
+    // 沒有原始 Snapshot → 不得猜測或用 JobRecord.snapshot fallback
+    await expect(restoreNativeBookmarks()).rejects.toThrow(/no original snapshot/)
     expect(m.live.f.map(n => n.id)).toEqual(['a', 'z'])
+  })
+
+  it('原始順序已復原後再次 restore 不移動任何節點', async () => {
+    const m = makeChromeMock({
+      f: [
+        { id: 'z', title: 'Zebra', url: 'https://z.co' },
+        { id: 'a', title: 'Alpha', url: 'https://a.co' },
+      ],
+    })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    await sortNativeBookmarks({
+      scope: 'selected-with-sub',
+      targetFolderIds: ['f'],
+      ignoreFolderIds: [],
+      sortCriteria: titleAsc,
+      sortSelf: true,
+      recurse: false,
+    })
+    const first = await restoreNativeBookmarks()
+    expect(first.status).toBe('completed')
+    expect(m.live.f.map(n => n.id)).toEqual(['z', 'a'])
+    const movesAfterFirst = m.moveLog.length
+
+    // 已在原始順序 → 復原工作 0 次 move
+    const second = await restoreNativeBookmarks()
+    expect(second.status).toBe('completed')
+    expect(second.stats.restored).toBe(0)
+    expect(m.moveLog).toHaveLength(movesAfterFirst)
+    expect(m.live.f.map(n => n.id)).toEqual(['z', 'a'])
   })
 
   it('hQ-3：awaiting-user 的排序工作可被安全復原（cancel 後 preflight 通過）', async () => {
@@ -666,5 +697,89 @@ describe('d2-r2-2 — restore 等待目前工作到達安全停止點', () => {
     expect(m.moveState.maxInFlight).toBe(1)
     // 最終回到排序前順序
     expect(m.live.f.map(n => n.id)).toEqual(['z', 'a', 'm'])
+  })
+})
+
+/* ================= D3 — P0-2：原始 Snapshot 生命週期與 restore 嚴格讀取 ================= */
+
+describe('d3-p0-2 — 原始 Snapshot 由 Executor 管理且 restore 嚴格讀取', () => {
+  it('新的一次真正排序取代舊基準；no-op 保留基準', async () => {
+    const m = makeChromeMock({ f: threeUnsorted.map(n => ({ ...n })) })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    await sortNativeBookmarks(sortF())
+    const first = (await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY] as SnapshotData
+    expect(first.folderOrders.f).toEqual(['z', 'a', 'm'])
+
+    // 使用者手動改成 m,z,a（真正需要移動）→ 新排序建立新基準
+    m.live.f = ['m', 'z', 'a'].map((id, index) => ({ ...m.live.f.find(n => n.id === id)!, index }))
+    const second = await sortNativeBookmarks(sortF())
+    expect(second.status).toBe('completed')
+    const replaced = (await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY] as SnapshotData
+    expect(replaced.folderOrders.f).toEqual(['m', 'z', 'a'])
+
+    // 已排序 → 再次排序為 no-op，不覆寫基準
+    const noop = await sortNativeBookmarks(sortF())
+    expect(noop.status).toBe('completed')
+    const kept = (await m.chromeMock.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY] as SnapshotData
+    expect(kept.folderOrders.f).toEqual(['m', 'z', 'a'])
+  })
+
+  it('原始 Snapshot 讀取失敗 → 停止，不用 JobRecord.snapshot 代替', async () => {
+    const m = makeChromeMock({ f: threeUnsorted.map(n => ({ ...n })) })
+    vi.stubGlobal('chrome', m.chromeMock)
+    await sortNativeBookmarks(sortF())
+    const movesBefore = m.moveLog.length
+
+    // 只讓原始 Snapshot 的讀取失敗（其他 key 正常）
+    const originalGet = m.chromeMock.storage.local.get
+    m.chromeMock.storage.local.get = (keys: string | string[]) => {
+      const ks = Array.isArray(keys) ? keys : [keys]
+      if (ks.includes(SORT_SNAPSHOT_KEY))
+        return Promise.reject(new Error('storage read failed'))
+      return originalGet(keys)
+    }
+
+    await expect(restoreNativeBookmarks()).rejects.toThrow(/cannot read original snapshot/)
+    expect(m.moveLog).toHaveLength(movesBefore)
+    // JobRecord.snapshot 仍存在，但不得被當成復原基準
+    expect((await m.chromeMock.storage.local.get(JOB_STORAGE_KEY))[JOB_STORAGE_KEY]).toBeTruthy()
+  })
+
+  it('原始 Snapshot 格式錯誤 → 停止，不得靜默採用', async () => {
+    const m = makeChromeMock({ f: threeUnsorted.map(n => ({ ...n })) })
+    vi.stubGlobal('chrome', m.chromeMock)
+    await sortNativeBookmarks(sortF())
+    const movesBefore = m.moveLog.length
+
+    await m.chromeMock.storage.local.set({ [SORT_SNAPSHOT_KEY]: { bad: true } })
+    await expect(restoreNativeBookmarks()).rejects.toThrow(/invalid original snapshot/)
+    expect(m.moveLog).toHaveLength(movesBefore)
+  })
+
+  it('random 未指定 seed：seed 持久化且重複排序冪等（0 次額外 move）', async () => {
+    const many: FakeNode[] = ['F', 'E', 'D', 'C', 'B', 'A'].map(id => ({
+      id,
+      title: `Title ${id}`,
+      url: `https://${id}.test`,
+    }))
+    const m = makeChromeMock({ f: many })
+    vi.stubGlobal('chrome', m.chromeMock)
+
+    const randomOpts = { ...sortF(), sortMode: 'random' as const }
+    const first = await sortNativeBookmarks(randomOpts)
+    expect(first.status).toBe('completed')
+    const order1 = m.live.f.map(n => n.id)
+    const moves1 = m.moveLog.length
+    const seed1 = (await m.chromeMock.storage.local.get(RANDOM_SEED_KEY))[RANDOM_SEED_KEY]
+    expect(typeof seed1).toBe('number')
+
+    const second = await sortNativeBookmarks(randomOpts)
+    expect(second.status).toBe('completed')
+    // 相同 seed + 相同 ID 集合 → 目標相同 → 第二輪 0 move
+    expect(m.live.f.map(n => n.id)).toEqual(order1)
+    expect(m.moveLog).toHaveLength(moves1)
+    const seed2 = (await m.chromeMock.storage.local.get(RANDOM_SEED_KEY))[RANDOM_SEED_KEY]
+    expect(seed2).toBe(seed1)
   })
 })

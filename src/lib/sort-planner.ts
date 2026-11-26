@@ -435,7 +435,10 @@ export function computeTargetOrder(
     middle = rest
   }
   else if (rule.mode === 'random') {
-    middle = seededShuffle(rest, rule.seed ?? 0)
+    // 冪等：先依穩定書籤 ID 建立固定輸入順序，目標不得依賴目前排列。
+    // 相同 seed + 相同 ID 集合 → 相同目標；只有 ID 集合增減才會改變結果。
+    const stable = [...rest].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    middle = seededShuffle(stable, rule.seed ?? 0)
   }
   else {
     const criteria = rule.criteria && rule.criteria.length > 0

@@ -336,3 +336,80 @@ describe('d2-r2-3 — Planner 與自動排序的規則繼承語意一致', () =>
     expect(h.sortCalls.map(c => c.targetIds[0])).toEqual(['f1'])
   })
 })
+
+/* ================= D3 — P1-1：版本號與有限輪次收斂 ================= */
+
+describe('d3-p1-1 — 排序期間的新需求不被誤刪，且能有限輪次收斂', () => {
+  it('排序期間 enqueue 提高版本號 → 完成時保留，下一輪 no-op 後才清空', async () => {
+    installChrome([{ id: '0', children: [{ id: 'f1' }] }])
+    setSettings({ targetFolderIds: ['f1'] })
+    let calls = 0
+    h.sortImpl = async () => {
+      calls++
+      if (calls === 1) {
+        // 模擬引擎自身 move 事件在排序期間到達
+        h.listeners.created?.('x', { parentId: 'f1' })
+        for (let i = 0; i < 12; i++)
+          await Promise.resolve()
+      }
+      return { status: 'completed' }
+    }
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    mod.registerNativeSortAutoListener()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    // 版本號已變 → 不得誤刪新需求
+    expect(h.session.get(PENDING)).toEqual(['f1'])
+
+    // 下一輪已無新事件 → 冪等 no-op 後清空
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.sortCalls).toHaveLength(2)
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+
+  it('random + autoSort：引擎自身 move 事件後在有限輪次內停止重排', async () => {
+    installChrome([{ id: '0', children: [{ id: 'f1' }] }])
+    setSettings({ sortMode: 'random', targetFolderIds: ['f1'] })
+    let calls = 0
+    h.sortImpl = async () => {
+      calls++
+      if (calls === 1) {
+        // 第一輪排序真的移動了 → 引擎事件再次 enqueue
+        h.listeners.created?.('x', { parentId: 'f1' })
+        for (let i = 0; i < 12; i++)
+          await Promise.resolve()
+      }
+      return { status: 'completed' }
+    }
+    h.session.set(PENDING, ['f1'])
+    const mod = await loadModule()
+    mod.registerNativeSortAutoListener()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    await vi.advanceTimersByTimeAsync(600)
+    await vi.advanceTimersByTimeAsync(600)
+    // 不得持續重排：輪次有界且佇列最終清空
+    expect(calls).toBeLessThanOrEqual(3)
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+
+  it('sW 重啟：未完成的 pending 保留，下次啟動後可正確恢復', async () => {
+    installChrome([{ id: '0', children: [{ id: 'f1' }] }])
+    setSettings({ targetFolderIds: ['f1'] })
+    h.sortImpl = async () => ({ status: 'failed' })
+    h.session.set(PENDING, ['f1'])
+    let mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    // 失敗保留，不得因 SW 重啟而遺失
+    expect(h.session.get(PENDING)).toEqual(['f1'])
+
+    // 模擬 Service Worker 重啟：模組重新載入（記憶體狀態消失，pending 仍在 session）
+    h.sortImpl = async () => ({ status: 'completed' })
+    mod = await loadModule()
+    await mod.resumeNativeSortAutoOnStartup()
+    await vi.advanceTimersByTimeAsync(600)
+    expect(h.session.get(PENDING)).toEqual([])
+  })
+})

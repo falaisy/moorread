@@ -331,6 +331,29 @@ describe('d2 random seed 可重現且可恢復（HQ-7）', () => {
     const order = computeTargetOrder(children, { mode: 'random', seed: 777 })
     expect([...order].sort()).toEqual(['A', 'B', 'C', 'D', 'E'])
   })
+
+  it('d3：同 seed、同 ID 集合、不同初始順序 → 目標完全相同（冪等）', () => {
+    const rule: NativeSortRule = { mode: 'random', seed: 20261126 }
+    const forward = computeTargetOrder(
+      ['E', 'A', 'D', 'B', 'C'].map((id, index) => bm(id, { index })),
+      rule,
+    )
+    const reversed = computeTargetOrder(
+      ['C', 'B', 'D', 'A', 'E'].map((id, index) => bm(id, { index })),
+      rule,
+    )
+    expect(forward).toEqual(reversed)
+    // 目標不依賴目前排列，只由 seed + ID 集合決定
+    expect([...forward].sort()).toEqual(['A', 'B', 'C', 'D', 'E'])
+  })
+
+  it('d3：ID 集合新增節點才合理改變目標（其餘節點相對順序可能變動）', () => {
+    const base = computeTargetOrder([bm('A'), bm('B'), bm('C')], { mode: 'random', seed: 99 })
+    const withD = computeTargetOrder([bm('A'), bm('B'), bm('C'), bm('D')], { mode: 'random', seed: 99 })
+    expect(withD).toHaveLength(4)
+    expect(new Set(withD)).toEqual(new Set(['A', 'B', 'C', 'D']))
+    expect(base).toHaveLength(3)
+  })
 })
 
 describe('buildSortPlan end-to-end', () => {

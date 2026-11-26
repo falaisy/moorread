@@ -14,6 +14,7 @@ import {
   _fingerprintForTest,
   JOB_STORAGE_KEY,
   SESSION_STORAGE_KEY,
+  SORT_SNAPSHOT_KEY,
   SortExecutor,
 } from './sort-executor'
 import { buildSortPlan, DEFAULT_SORT_CRITERIA, planToTargets } from './sort-planner'
@@ -34,11 +35,22 @@ class MockStorage implements StorageAdapter {
   local = new Map<string, unknown>()
   session = new Map<string, unknown>()
   localQuotaBytes = 10 * 1024 * 1024
+  /** 這些 key 的 getBytesInUse 會失敗（null = 整個 area） */
+  failBytesInUseKeys = new Set<string | null>()
+  /** 這些 key 的 localSet 會失敗 */
+  failSetKeys = new Set<string>()
+  /** 指定 key 的 localSet 延遲（ms），用於測試保存階段的取消競態 */
+  setDelayKeys = new Map<string, number>()
   async localGet<T>(k: string): Promise<T | undefined> {
     return (this.local.has(k) ? cloneValue(this.local.get(k)) : undefined) as T | undefined
   }
 
   async localSet(k: string, v: unknown): Promise<void> {
+    const delay = this.setDelayKeys.get(k)
+    if (delay)
+      await new Promise(r => setTimeout(r, delay))
+    if (this.failSetKeys.has(k))
+      throw new Error(`mock storage set failed: ${k}`)
     this.local.set(k, cloneValue(v))
   }
 
@@ -47,6 +59,8 @@ class MockStorage implements StorageAdapter {
   }
 
   async localGetBytesInUse(k: string | null): Promise<number> {
+    if (this.failBytesInUseKeys.has(k))
+      throw new Error('mock getBytesInUse failed')
     if (k === null) {
       let total = 0
       for (const v of this.local.values())
@@ -91,6 +105,10 @@ class MockBookmarks implements BookmarkAdapter {
   // 注入控制
   eventDelayMs = 0
   moveDelayMs = 0
+  /** getChildren 延遲（ms），用於測試 createJob／recover 讀取期間的取消競態 */
+  readDelayMs = 0
+  /** move 套用前呼叫（在 pending 已保存、move 已發出後） */
+  beforeMove: ((id: string) => void | Promise<void>) | null = null
   /** 同時進行中的 move API 數量（驗證 restore 不會與執行中的工作重疊） */
   moveInFlight = 0
   maxMoveInFlight = 0
@@ -141,6 +159,8 @@ class MockBookmarks implements BookmarkAdapter {
     // 模擬讀取失敗
     if (this.failReadIds.has(folderId))
       throw new Error(`mock read failed: ${folderId}`)
+    if (this.readDelayMs > 0)
+      await new Promise(r => setTimeout(r, this.readDelayMs))
     const ids = this.children.get(folderId) ?? []
     return ids.map((id, index) => {
       const m = this.meta.get(id) ?? { id, parentId: folderId, isFolder: false }
@@ -151,6 +171,8 @@ class MockBookmarks implements BookmarkAdapter {
   async move(id: string, dest: { parentId: string, index: number }): Promise<void> {
     if (this.hangMoveIds.has(id))
       return new Promise(() => {}) // 永遠不 resolve，模擬 SW 在 move 中被殺
+    if (this.beforeMove)
+      await this.beforeMove(id)
     this.moveInFlight++
     this.maxMoveInFlight = Math.max(this.maxMoveInFlight, this.moveInFlight)
     try {
@@ -987,16 +1009,15 @@ describe('d2-r2-5 — 外部事件範圍判斷', () => {
 
 /* ===================== D2 第二輪：配額估算 ===================== */
 describe('d2-r2-6 — 儲存配額估算（Chrome 語意）', () => {
-  /** 先跑一次（大配額）取得最終 JobRecord 大小 */
-  async function measureJobBytes(): Promise<number> {
+  /** 先跑一次（大配額）取得 storage 實際總用量（job + 原始 Snapshot 等所有 key） */
+  async function measureTotalBytes(): Promise<number> {
     const { tree, snapshot } = makeTree(['C', 'B', 'A'])
     const b = new MockBookmarks()
     const s = new MockStorage()
     b.setFolder('1', ['C', 'B', 'A'])
     const res = await makeExecutor(b, s).runSort(planTargets(tree, ascTitle), snapshot)
     expect(res.completed).toBe(true)
-    const job = (await s.localGet<JobRecord>(JOB_STORAGE_KEY))!
-    return utf8(JSON.stringify(job))
+    return s.localGetBytesInUse(null)
   }
 
   function freshUnsorted(): { bookmarks: MockBookmarks, storage: MockStorage } {
@@ -1007,7 +1028,7 @@ describe('d2-r2-6 — 儲存配額估算（Chrome 語意）', () => {
   }
 
   it('同一 JobRecord 多次更新不會誤判配額不足', async () => {
-    const bytes = await measureJobBytes()
+    const bytes = await measureTotalBytes()
     const { bookmarks, storage } = freshUnsorted()
     // 1.5 倍：舊算法（used + estimate 重複計同一份 job）會在第 2 次保存誤判
     storage.localQuotaBytes = Math.floor(bytes * 1.5)
@@ -1017,7 +1038,7 @@ describe('d2-r2-6 — 儲存配額估算（Chrome 語意）', () => {
   })
 
   it('其他 Key 已佔用空間時能正確判斷', async () => {
-    const bytes = await measureJobBytes()
+    const bytes = await measureTotalBytes()
     const otherValue = 'x'.repeat(Math.ceil(bytes * 3))
     const otherBytes = utf8(JSON.stringify(otherValue))
     const { tree, snapshot } = makeTree(['C', 'B', 'A'])
@@ -1073,6 +1094,298 @@ describe('d2-r2-6 — 儲存配額估算（Chrome 語意）', () => {
     const s2 = new MockStorage()
     s2.localQuotaBytes = utf16Len + 50 // 只有用字元數估算才會通過
     await expect(makeExecutor(b2, s2).runSort(targets, snapshot)).rejects.toThrow(/insufficient storage/)
+  })
+})
+
+/* ================= D3 — P0-1：取消涵蓋完整生命週期 ================= */
+
+/** 建立一個「尚未執行」的 active job 記錄（模擬 SW 中斷後的持久化狀態） */
+function makeResumableJob(snapshot: SnapshotData, targets: JobRecord['targets']): JobRecord {
+  return {
+    jobId: 'resume-1',
+    kind: 'sort',
+    sessionId: 'sess-1',
+    startedAt: Date.now(),
+    status: 'active',
+    targets,
+    snapshot,
+    cursorFolderIndex: 0,
+    cursorStep: 0,
+    hConfirmed: _fingerprintForTest({ 1: ['C', 'B', 'A'] }),
+    pending: null,
+    externalDirty: false,
+    movedBookmarks: 0,
+    movedFolders: 0,
+    foldersProcessed: 0,
+    verificationFailures: 0,
+    skipped: [],
+  }
+}
+
+describe('d3-p0-1 — 取消涵蓋 createJob／恢復準備期間', () => {
+  it('createJob 讀取期間取消 → 工作 failed(cancelled)，0 次 move，Storage 狀態一致', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    bookmarks.readDelayMs = 40
+    const exec = makeExecutor(bookmarks, storage)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 10)) // createJob 尚未完成、工作尚未進入 continueJob
+    await exec.cancel()
+    const result = await p
+    expect(result.completed).toBe(false)
+    expect(result.job.status).toBe('failed')
+    expect(result.job.stopReason).toBe('cancelled')
+    expect(bookmarks.maxMoveInFlight).toBe(0)
+    const persisted = (await storage.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    expect(persisted.status).toBe('failed')
+    expect(persisted.stopReason).toBe('cancelled')
+    // 取消後不得留下任何已執行的 move
+    expect(bookmarks.children.get('1')).toEqual(['C', 'B', 'A'])
+  })
+
+  it('原始 Snapshot 保存期間取消 → 不得執行任何 move', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    storage.setDelayKeys.set(SORT_SNAPSHOT_KEY, 40)
+    const exec = makeExecutor(bookmarks, storage)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 20)) // snapshot 仍在保存
+    await exec.cancel()
+    const result = await p
+    expect(result.completed).toBe(false)
+    expect(result.job.status).toBe('failed')
+    expect(result.job.stopReason).toBe('cancelled')
+    expect(bookmarks.maxMoveInFlight).toBe(0)
+    expect(bookmarks.children.get('1')).toEqual(['C', 'B', 'A'])
+  })
+
+  it('resumeAfterRestart 恢復準備期間取消 → 不得繼續執行', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    const job = makeResumableJob(snapshot, planTargets(tree, ascTitle))
+    job.status = 'awaiting-user'
+    await storage.localSet(JOB_STORAGE_KEY, job)
+    bookmarks.readDelayMs = 40
+    const exec = makeExecutor(bookmarks, storage)
+    const p = exec.resumeAfterRestart()
+    await new Promise(r => setTimeout(r, 10))
+    await exec.cancel()
+    const resumed = await p
+    expect(resumed!.status).toBe('failed')
+    expect(resumed!.stopReason).toBe('cancelled')
+    expect(bookmarks.maxMoveInFlight).toBe(0)
+    expect(bookmarks.children.get('1')).toEqual(['C', 'B', 'A'])
+  })
+
+  it('resumeOnStartup 讀取資料期間取消 → 不得重新啟動工作', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    const job = makeResumableJob(snapshot, planTargets(tree, ascTitle))
+    await storage.localSet(JOB_STORAGE_KEY, job)
+    await storage.sessionSet(SESSION_STORAGE_KEY, { sessionId: job.sessionId })
+    bookmarks.readDelayMs = 40
+    const exec = makeExecutor(bookmarks, storage)
+    const p = exec.resumeOnStartup()
+    await new Promise(r => setTimeout(r, 10))
+    await exec.cancel()
+    const resumed = await p
+    expect(resumed!.status).toBe('failed')
+    expect(resumed!.stopReason).toBe('cancelled')
+    expect(bookmarks.maxMoveInFlight).toBe(0)
+  })
+
+  it('move 期間發生外部變動 → 已完成的 API 不再發出下一筆 move', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    let fired = false
+    bookmarks.beforeMove = async () => {
+      if (fired)
+        return
+      fired = true
+      // 第一筆 move 已發出（pending 已保存）後，使用者在同資料夾移動
+      bookmarks.emitMoved('B', { parentId: '1', oldParentId: '1', index: 1, oldIndex: 1 })
+      // 讓外部變動處理完成（觸發共用停止訊號）後才真正套用第一筆 move
+      for (let i = 0; i < 20; i++)
+        await Promise.resolve()
+    }
+    const exec = makeExecutor(bookmarks, storage, 30)
+    const result = await exec.runSort(planTargets(tree, ascTitle), snapshot)
+    expect(result.completed).toBe(false)
+    expect(result.job.status).toBe('stopped-external')
+    // 只發出一筆 move，之後的 move 全部取消
+    expect(bookmarks.maxMoveInFlight).toBe(1)
+    expect(bookmarks.children.get('1')).not.toEqual(['A', 'B', 'C'])
+  })
+
+  it('markExternal 與 cancel 同時發生 → 終止狀態單調，不回到 active', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['B', 'A'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    bookmarks.suppressEvents = true
+    const exec = makeExecutor(bookmarks, storage, 30)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 5))
+    bookmarks.emitReordered('1', ['A', 'B'])
+    await exec.cancel()
+    const result = await p
+    expect(['failed', 'stopped-external']).toContain(result.job.status)
+    const persisted = (await storage.localGet<JobRecord>(JOB_STORAGE_KEY))!
+    expect(['failed', 'stopped-external']).toContain(persisted.status)
+    expect(['cancelled', 'external']).toContain(persisted.stopReason)
+  })
+})
+
+/* ================= D3 — P1-2：事件節點本身的範圍辨識 ================= */
+
+describe('d3-p1-2 — 事件節點本身也在範圍判斷內', () => {
+  it('排序目標資料夾本身被移到範圍外 → 安全停止', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const tree: PlannerNode[] = [{
+      id: '0',
+      title: 'root',
+      children: [{
+        id: '1',
+        title: 'folder',
+        children: [
+          { id: '2', title: 'sub', children: [{ id: 'x', title: 'X', url: 'u' }] },
+          { id: 'B', title: 'B', url: 'u' },
+          { id: 'A', title: 'A', url: 'u' },
+        ],
+      }],
+    }]
+    const snapshot = captureSnapshot(tree, ['1', '2'])
+    bookmarks.setFolder('1', ['2', 'B', 'A'])
+    bookmarks.setFolder('2', ['x'])
+    bookmarks.setFolder('99', [])
+    bookmarks.suppressEvents = true
+    const exec = makeExecutor(bookmarks, storage, 40)
+    const plan = buildSortPlan(tree, {
+      scope: 'selected-only',
+      targetFolderIds: ['1'],
+      ignoreFolderIds: [],
+      defaultRule: ascTitle,
+    })
+    const p = exec.runSort(planToTargets(plan), snapshot)
+    await new Promise(r => setTimeout(r, 5))
+    // 被移動的是排序目標資料夾 '2' 本身（父/舊父都不在範圍）
+    bookmarks.emitMoved('2', { parentId: '99', oldParentId: '1', index: 0, oldIndex: 0 })
+    const result = await p
+    expect(result.job.status).toBe('stopped-external')
+  })
+
+  it('排序目標資料夾本身被刪除（父資料夾在範圍外）→ 安全停止', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const tree: PlannerNode[] = [{
+      id: '0',
+      title: 'root',
+      children: [{
+        id: '1',
+        title: 'folder',
+        children: [
+          { id: 'B', title: 'B', url: 'u' },
+          { id: 'A', title: 'A', url: 'u' },
+        ],
+      }],
+    }]
+    const snapshot = captureSnapshot(tree, ['1'])
+    bookmarks.setFolder('1', ['B', 'A'])
+    bookmarks.suppressEvents = true
+    const exec = makeExecutor(bookmarks, storage, 40)
+    const p = exec.runSort(planTargets(tree, ascTitle), snapshot)
+    await new Promise(r => setTimeout(r, 5))
+    // 刪除的節點就是排序範圍內的資料夾（parentId 在範圍外）
+    await exec.onRemoved('99', {
+      parentId: '0',
+      index: 0,
+      node: { id: '1', parentId: '0', index: 0 },
+    })
+    const result = await p
+    expect(result.job.status).toBe('stopped-external')
+  })
+})
+
+/* ================= D3 — P1-4：配額無法確認時 fail-closed ================= */
+
+describe('d3-p1-4 — Storage 配額查詢失敗即安全停止', () => {
+  it('整體用量讀取失敗 → 拒絕啟動、0 次 move、不寫入原始 Snapshot', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    storage.failBytesInUseKeys.add(null)
+    const exec = makeExecutor(bookmarks, storage)
+    await expect(exec.runSort(planTargets(tree, ascTitle), snapshot))
+      .rejects
+      .toThrow(/cannot determine storage usage/)
+    expect(bookmarks.maxMoveInFlight).toBe(0)
+    expect(await storage.localGet(SORT_SNAPSHOT_KEY)).toBeUndefined()
+  })
+
+  it('舊 JobRecord 用量讀取失敗 → 停止，不假設為 0', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    storage.failBytesInUseKeys.add(JOB_STORAGE_KEY)
+    const exec = makeExecutor(bookmarks, storage)
+    await expect(exec.runSort(planTargets(tree, ascTitle), snapshot))
+      .rejects
+      .toThrow(/cannot determine storage usage/)
+    expect(bookmarks.maxMoveInFlight).toBe(0)
+    expect(await storage.localGet(SORT_SNAPSHOT_KEY)).toBeUndefined()
+  })
+})
+
+/* ================= D3 — P0-2：原始 Snapshot 生命週期由 Executor 管理 ================= */
+
+describe('d3-p0-2 — 原始 Snapshot 生命週期', () => {
+  it('真正需要移動的排序保存原始 Snapshot，completed 後保留', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    const exec = makeExecutor(bookmarks, storage)
+    const result = await exec.runSort(planTargets(tree, ascTitle), snapshot)
+    expect(result.completed).toBe(true)
+    const saved = await storage.localGet<SnapshotData>(SORT_SNAPSHOT_KEY)
+    expect(saved?.folderOrders['1']).toEqual(['C', 'B', 'A'])
+  })
+
+  it('no-op 工作不建立原始 Snapshot', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['A', 'B', 'C'])
+    bookmarks.setFolder('1', ['A', 'B', 'C'])
+    const exec = makeExecutor(bookmarks, storage)
+    const result = await exec.runSort(planTargets(tree, ascTitle), snapshot)
+    expect(result.completed).toBe(true)
+    expect(await storage.localGet(SORT_SNAPSHOT_KEY)).toBeUndefined()
+  })
+
+  it('discard 釋放原始 Snapshot 與工作記錄', async () => {
+    const bookmarks = new MockBookmarks()
+    const storage = new MockStorage()
+    const { tree, snapshot } = makeTree(['C', 'B', 'A'])
+    bookmarks.setFolder('1', ['C', 'B', 'A'])
+    const exec = makeExecutor(bookmarks, storage)
+    await exec.runSort(planTargets(tree, ascTitle), snapshot)
+    expect(await storage.localGet(SORT_SNAPSHOT_KEY)).toBeTruthy()
+    await exec.discardJob()
+    expect(await storage.localGet(SORT_SNAPSHOT_KEY)).toBeUndefined()
+    expect(await storage.localGet(JOB_STORAGE_KEY)).toBeUndefined()
   })
 })
 

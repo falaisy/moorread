@@ -221,8 +221,11 @@ export function SettingsNativeSortTab() {
         sortCriteria: settings.sortCriteria,
         sortSelf: settings.sortSelf,
         sortMode: settings.sortMode,
-        // 隨機模式每次都用新 seed 洗牌（不固定）；實際排列已存於 job targets 供復原
-        randomSeed: settings.sortMode === 'random' ? undefined : settings.randomSeed,
+        // 隨機模式：使用者主動排序時產生新 seed（會被持久化），
+        // 自動排序之後沿用同一 seed，目標順序穩定、可收斂、可復原。
+        randomSeed: settings.sortMode === 'random'
+          ? (Date.now() ^ Math.floor(Math.random() * 0x7FFFFFFF)) >>> 0
+          : settings.randomSeed,
         pinnedTop: settings.pinnedTop,
         pinnedBottom: settings.pinnedBottom,
         foldersFirst: settings.foldersFirst,
@@ -327,7 +330,11 @@ export function SettingsNativeSortTab() {
                           size="sm"
                           variant="outline"
                           onClick={() => {
-                            void restoreNativeBookmarks()
+                            // 原始 Snapshot 不存在／讀取失敗 → 明確回報無可復原，不靜默失敗
+                            void restoreNativeBookmarks().catch((cause) => {
+                              const message = cause instanceof Error ? cause.message : String(cause)
+                              setError(t('nativeSortFailed', { message }))
+                            })
                           }}
                         >
                           <RotateCcw className="mr-1.5 h-3.5 w-3.5" />

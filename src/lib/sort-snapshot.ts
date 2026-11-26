@@ -47,6 +47,38 @@ export function captureSnapshot(
   }
 }
 
+/**
+ * 驗證外部讀入的 Snapshot 格式是否完整。
+ * 讀取失敗、格式錯誤或無法確認完整性時，呼叫端必須停止並回報，不得猜測或 fallback。
+ */
+export function isValidSnapshot(raw: unknown): raw is SnapshotData {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw))
+    return false
+  const snap = raw as Record<string, unknown>
+  if (typeof snap.capturedAt !== 'number' || !Number.isFinite(snap.capturedAt))
+    return false
+  if (!Array.isArray(snap.scopeFolderIds) || !snap.scopeFolderIds.every(id => typeof id === 'string'))
+    return false
+  if (!snap.folderOrders || typeof snap.folderOrders !== 'object' || Array.isArray(snap.folderOrders))
+    return false
+  for (const order of Object.values(snap.folderOrders as Record<string, unknown>)) {
+    if (!Array.isArray(order) || !order.every(id => typeof id === 'string'))
+      return false
+  }
+  if (!snap.nodes || typeof snap.nodes !== 'object' || Array.isArray(snap.nodes))
+    return false
+  for (const node of Object.values(snap.nodes as Record<string, unknown>)) {
+    if (!node || typeof node !== 'object')
+      return false
+    const n = node as Record<string, unknown>
+    if (typeof n.id !== 'string' || typeof n.parentId !== 'string'
+      || typeof n.index !== 'number' || typeof n.isFolder !== 'boolean') {
+      return false
+    }
+  }
+  return true
+}
+
 /** 判斷節點是否仍在快照中的原始位置（用於外部變動偵測） */
 export function isNodeInOriginalPlace(
   snapshot: SnapshotData,

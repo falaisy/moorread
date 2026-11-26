@@ -47,7 +47,7 @@ import {
 import {
   buildRestorePlan,
   captureSnapshot,
-
+  isValidSnapshot,
   planFolderMoves as planFolderMovesPure,
 } from './sort-snapshot'
 
@@ -238,22 +238,66 @@ function mapResult(r: ExecutorResult): NativeBookmarkSortResult {
   }
 }
 
-function buildDefaultRule(options: NativeBookmarkSortOptions): NativeSortRule {
+function buildDefaultRule(options: NativeBookmarkSortOptions, randomSeed?: number): NativeSortRule {
   return normalizeSortRule({
     mode: options.sortMode ?? 'criteria',
     criteria: options.sortCriteria,
     foldersFirst: options.foldersFirst ?? true,
-    seed: options.randomSeed,
+    seed: randomSeed ?? options.randomSeed,
     pinnedTop: options.pinnedTop,
     pinnedBottom: options.pinnedBottom,
     inherit: true,
   })
 }
 
+/** Random seed 的持久化位置（全域與資料夾級共用同一套 seed 管理） */
+export const RANDOM_SEED_KEY = 'moorread:sort-random-seed'
+
+/**
+ * 取得穩定的 Random seed：
+ *  - 呼叫端明確指定（例如使用者主動按排序）→ 使用並持久化該 seed。
+ *  - 否則讀取持久化 seed；不存在才建立一次並寫回。
+ * 自動排序重複呼叫不得每次重新抽 seed，否則目標順序永遠在變、無法收斂。
+ */
+async function resolveRandomSeed(explicit?: number): Promise<number> {
+  const hasExplicit = typeof explicit === 'number' && Number.isFinite(explicit)
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
+    if (hasExplicit)
+      return (explicit as number) >>> 0
+    throw new Error('storage api unavailable: cannot resolve random seed')
+  }
+  let seed: number
+  if (hasExplicit) {
+    seed = (explicit as number) >>> 0
+  }
+  else {
+    let stored: Record<string, unknown>
+    try {
+      stored = await chrome.storage.local.get(RANDOM_SEED_KEY)
+    }
+    catch (cause) {
+      throw new Error(`cannot read random seed: ${cause instanceof Error ? cause.message : 'unknown error'}`)
+    }
+    const value = stored?.[RANDOM_SEED_KEY]
+    if (typeof value === 'number' && Number.isFinite(value))
+      return value >>> 0
+    seed = (Date.now() ^ Math.floor(Math.random() * 0x7FFFFFFF)) >>> 0
+  }
+  try {
+    await chrome.storage.local.set({ [RANDOM_SEED_KEY]: seed })
+  }
+  catch (cause) {
+    throw new Error(`cannot persist random seed: ${cause instanceof Error ? cause.message : 'unknown error'}`)
+  }
+  return seed
+}
+
 /**
  * 批量排序 Chrome 原生書籤（新引擎入口）。
  * 失敗/外部變動/中斷時 status !== 'completed'，呼叫端不可宣稱成功。
- * 原始 Snapshot 只在成功取得執行權後保存；restore job 與它分開保存、互不覆蓋。
+ *
+ * 原始 Snapshot 的生命週期由 Executor 單一管理：真正需要移動的新排序才建立，
+ * no-op、被拒絕、resume、restore 都不會覆寫；restore job 與它分開保存。
  */
 export async function sortNativeBookmarks(
   options: NativeBookmarkSortOptions,
@@ -261,20 +305,27 @@ export async function sortNativeBookmarks(
   if (typeof chrome === 'undefined' || !chrome.bookmarks)
     throw new Error('bookmarks api unavailable')
 
-  // HQ-7：random 模式且未指定 seed → 生成新 seed（每次排序不同，可恢復）
-  if (options.sortMode === 'random' && options.randomSeed === undefined) {
-    options = { ...options, randomSeed: (Date.now() ^ Math.floor(Math.random() * 1e9)) >>> 0 }
-  }
+  // Online random：seed 持久化且穩定（全域與資料夾級共用），不得每次重抽
+  const needsRandomSeed = options.sortMode === 'random'
+    || (options.folderRules ?? []).some(fr => fr.rule?.mode === 'random' && fr.rule.seed === undefined)
+  const randomSeed = needsRandomSeed ? await resolveRandomSeed(options.randomSeed) : options.randomSeed
 
   const tree = await readPlannerTree()
-  const defaultRule = buildDefaultRule(options)
+  const defaultRule = buildDefaultRule(options, randomSeed)
+  // 資料夾級 random 規則同樣套用穩定 seed（缺 seed 時沿用全域管理的那組）
+  const folderRules = options.folderRules?.map((fr) => {
+    const rule = normalizeSortRule(fr.rule)
+    if (rule.mode === 'random' && rule.seed === undefined && randomSeed !== undefined)
+      rule.seed = randomSeed
+    return { folderId: fr.folderId, rule }
+  })
 
   const plan = buildSortPlan(tree, {
     scope: options.scope,
     targetFolderIds: options.targetFolderIds ?? [],
     ignoreFolderIds: options.ignoreFolderIds ?? [],
     defaultRule,
-    folderRules: options.folderRules,
+    folderRules,
     sortSelf: options.sortSelf,
     recurse: options.recurse,
   })
@@ -283,67 +334,57 @@ export async function sortNativeBookmarks(
   const scopeFolderIds = plan.folders.map(f => f.folderId)
   const snapshot = captureSnapshot(tree, scopeFolderIds)
 
-  // 缺陷 1：原始 Snapshot 只能在「成功取得執行權且有實際移動」後保存。
-  //  - 已有工作 / 啟動失敗 → runSort 在 createJob 前被拒絕，不會呼叫 onAcquired。
-  //  - 自動排序的 no-op → executor 判定沒有移動，不會呼叫 onAcquired。
-  //  - 已存在原始 Snapshot（尚未 restore/discard）→ 保留最初的那份，不覆寫。
-  //  - 寫入失敗 → 拋錯讓 executor 立即 failed，且不執行任何 move。
-  const result = await nativeSortExecutor.runSort(targets, snapshot, {
-    onAcquired: async () => {
-      if (typeof chrome === 'undefined' || !chrome.storage?.local)
-        return
-      const existing = await chrome.storage.local.get(SORT_SNAPSHOT_KEY)
-      if (existing[SORT_SNAPSHOT_KEY])
-        return
-      await chrome.storage.local.set({ [SORT_SNAPSHOT_KEY]: snapshot })
-    },
-  })
+  // Executor 決定原始 Snapshot 是否/何時保存：
+  //  - 已有工作 / 啟動失敗 → runSort 在 createJob 前被拒絕，不會保存。
+  //  - 自動排序的 no-op → executor 判定沒有移動，不會保存。
+  //  - 保存失敗 → 工作立即 failed，且不執行任何 move。
+  const result = await nativeSortExecutor.runSort(targets, snapshot)
   return mapResult(result)
 }
 
 /**
- * 依最近一次工作的快照執行安全復原（獨立 restore job，有自己的快照與中斷恢復）。
+ * 讀取「最初排序前」的原始 Snapshot。
+ * 讀取失敗、格式錯誤或不存在都必須明確回報，不得猜測或用其他 Snapshot fallback。
+ */
+async function readOriginalSnapshot(): Promise<SnapshotData> {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local)
+    throw new Error('storage api unavailable: cannot read original snapshot')
+  let stored: Record<string, unknown>
+  try {
+    stored = await chrome.storage.local.get(SORT_SNAPSHOT_KEY)
+  }
+  catch (cause) {
+    throw new Error(`cannot read original snapshot: ${cause instanceof Error ? cause.message : 'unknown error'}`)
+  }
+  const raw = stored[SORT_SNAPSHOT_KEY]
+  if (raw === undefined || raw === null)
+    throw new Error('no original snapshot to restore')
+  if (!isValidSnapshot(raw))
+    throw new Error('invalid original snapshot: refusing to restore')
+  return raw
+}
+
+/**
+ * 依最初排序前的原始 Snapshot 執行安全復原（獨立 restore job，有自己的快照與中斷恢復）。
  * 規則見 sort-snapshot.buildRestorePlan：已刪除不重建、父資料夾不存在跳過、
  * 跨資料夾移動跳過、排序期間新增節點保留在尾端且相對順序不變。
  *
- * 缺陷 5：回傳的 stats 以 Executor 實際成功移動數為準，不用計畫預估值。
- * 缺陷 6：優先從獨立的 SORT_SNAPSHOT_KEY 讀最初排序前的快照；若不存在才退回
- *         最近一次 job 的 snapshot。restore 不覆蓋 SORT_SNAPSHOT_KEY，
- *         只有使用者 discard 時才清除。
+ * - stats 以 Executor 實際成功移動數為準，不用計畫預估值。
+ * - 原始 Snapshot 讀取失敗／格式錯誤／不存在 → 直接停止並回報，不 fallback 到 JobRecord.snapshot。
+ * - restore 不覆蓋原始 Snapshot，只有使用者 discard 才清除。
  */
 export async function restoreNativeBookmarks(): Promise<NativeBookmarkRestoreResult> {
   if (typeof chrome === 'undefined' || !chrome.bookmarks)
     throw new Error('bookmarks api unavailable')
 
-  // 先安全停可能正在進行的 sort job：cancel() 不走 enqueue，立即觸發協作式取消
+  // 先安全停可能正在進行的 sort job：cancel() 不走 enqueue，立即觸發協作式停止
   await nativeSortExecutor.cancel()
   // 可靠等待目前執行鏈到達安全停止點（含執行中的 move 完成後的狀態處理），
   // 不用固定延遲猜測；restore 啟動前 preflightNoActive 會再檢查。
   await nativeSortExecutor.whenIdle()
 
-  // 缺陷 6：優先讀獨立的 SORT_SNAPSHOT_KEY（最初排序前快照），restore 完成前不清除
-  let snapshot: SnapshotData | null = null
-  try {
-    snapshot = (await chrome.storage.local.get(SORT_SNAPSHOT_KEY))[SORT_SNAPSHOT_KEY] as SnapshotData | undefined
-    if (snapshot && typeof snapshot === 'object' && snapshot.folderOrders) {
-      // 有效，使用這個最初快照；最近一次 JOB_STORAGE_KEY 可能已被 restore job 覆蓋
-    }
-    else {
-      snapshot = null
-    }
-  }
-  catch {
-    snapshot = null
-  }
-
-  // 退回：最近一次 job 的 snapshot（可能是 sort job 或上一次 restore job）
-  if (!snapshot) {
-    const job = await nativeSortExecutor.getJob()
-    snapshot = job?.snapshot ?? null
-  }
-
-  if (!snapshot)
-    throw new Error('no snapshot to restore')
+  // 只使用獨立保存的原始 Snapshot；不得退回可能已被 restore job 更新的 JobRecord.snapshot
+  const snapshot = await readOriginalSnapshot()
 
   const tree = await readPlannerTree()
 

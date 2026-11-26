@@ -175,6 +175,13 @@ export interface JobRecord {
   pending: PendingMove | null
   /** 是否偵測到外部變動 */
   externalDirty: boolean
+  /**
+   * 停止原因（與 status 分開保存，避免不同停止原因都混成同一種 failed）：
+   *  - cancelled        使用者取消
+   *  - external         外部變動（通常 status=stopped-external）
+   *  - failed           執行/儲存/驗證失敗
+   */
+  stopReason?: 'cancelled' | 'external' | 'failed'
   /** 統計 */
   movedBookmarks: number
   movedFolders: number

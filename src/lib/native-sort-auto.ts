@@ -27,6 +27,22 @@ const settingsStorage = createStoragePort('sync')
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let flushing = false
 
+/**
+ * 單一 Promise chain：序列化 pending 的讀取／增加／claim／完成刪除／失敗保留／停用清空。
+ * 只包住佇列 Set 的讀改寫，不可包住整段 sortNativeBookmarks()。
+ * SW 重啟後 chain 與版本號自然重置，靠「持久化 pending + Executor 外部變動偵測 +
+ * verifyFolder + 未 completed 保留 pending + resume」恢復，不需持久化它們。
+ */
+let queueChain: Promise<unknown> = Promise.resolve()
+/** 每個資料夾的版本號：排序期間有新 enqueue 就增加，完成時版本未變才可刪除 */
+const versions = new Map<string, number>()
+
+function scoped<T>(fn: () => Promise<T>): Promise<T> {
+  const next = queueChain.then(fn)
+  queueChain = next.catch(() => undefined)
+  return next
+}
+
 async function readPending(): Promise<Set<string>> {
   const stored = await chrome.storage.session.get(PENDING_KEY)
   const raw = stored?.[PENDING_KEY]
@@ -172,16 +188,21 @@ async function enqueue(folderIds: Array<string | undefined>): Promise<void> {
   const ids = folderIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
   if (ids.length === 0)
     return
-  const pending = await readPending()
-  let changed = false
-  for (const id of ids) {
-    if (!pending.has(id)) {
-      pending.add(id)
-      changed = true
+  // 讀取＋合併＋寫入必須序列化：兩個事件同時發生時不得互相覆蓋
+  await scoped(async () => {
+    const pending = await readPending()
+    let changed = false
+    for (const id of ids) {
+      if (!pending.has(id)) {
+        pending.add(id)
+        changed = true
+      }
+      // 每次新需求都提高版本號：排序完成時版本不同 → 不得誤刪這筆新需求
+      versions.set(id, (versions.get(id) ?? 0) + 1)
     }
-  }
-  if (changed)
-    await writePending(pending)
+    if (changed)
+      await writePending(pending)
+  })
   scheduleFlush()
 }
 
@@ -202,12 +223,14 @@ async function flush(): Promise<void> {
   flushing = true
   // 同一次 flush 內每個資料夾只嘗試一次，避免持續失敗者被無限快速重試
   const attempted = new Set<string>()
+  /** 每個資料夾 claim 時的版本號（完成時版本未變才可刪除 pending） */
+  const claimed = new Map<string, number>()
   let treeUnavailable = false
   try {
     const settings = await loadSettings()
     if (!settings?.enabled || !settings.autoSort) {
-      // 自動排關閉：清空佇列，避免遺留
-      await writePending(new Set())
+      // 自動排關閉：清空佇列，避免遺留（同樣走序列化，不与 enqueue 互相覆蓋）
+      await scoped(() => writePending(new Set()))
       return
     }
 
@@ -224,23 +247,33 @@ async function flush(): Promise<void> {
       ? settings.scope
       : 'selected-only'
 
-    // 缺陷 3+4：循環處理 pending —— 每次從 storage 讀最新狀態、完成後立即寫回，
-    // 讓 enqueue 期間新加入的 folderId 不被 flush 的舊 Set 覆蓋。
+    // 循環處理 pending —— claim／完成／移除全部經由同一個 Promise chain，
+    // 但排序本身（sortNativeBookmarks）不在 chain 內，避免長時間鎖住佇列。
     // 每個資料夾在同一輪只嘗試一次；失敗/外部變動/忙碌者 **保留** 在 pending，
     // 等下一次書籤事件或 SW 啟動再處理（不立即重試，避免迴圈）。
     for (;;) {
-      const pending = await readPending()
-      const folderId = [...pending].find(id => !attempted.has(id))
-      if (!folderId)
+      const claim = await scoped(async () => {
+        const pending = await readPending()
+        const folderId = [...pending].find(id => !attempted.has(id))
+        if (!folderId)
+          return null
+        return { folderId, version: versions.get(folderId) ?? 0 }
+      })
+      if (!claim)
         break
+      const { folderId, version } = claim
       attempted.add(folderId)
+      claimed.set(folderId, version)
 
       // HQ-5 + 範圍檢查
       const manual = isManualFolder(folderId, settings, parentOf)
-      if (!isFolderAllowed(folderId, settings, parentOf) || manual) {
-        // 不處理的 folder：從 pending 移除（一次性決策）
-        pending.delete(folderId)
-        await writePending(pending)
+      if (manual || !isFolderAllowed(folderId, settings, parentOf)) {
+        // 不處理的 folder：從 pending 移除（一次性決策，仍在 chain 內避免覆蓋新事件）
+        await scoped(async () => {
+          const pending = await readPending()
+          pending.delete(folderId)
+          await writePending(pending)
+        })
         continue
       }
 
@@ -253,17 +286,23 @@ async function flush(): Promise<void> {
           sortSelf: true,
           recurse: true,
           sortMode: settings.sortMode,
-          randomSeed: settings.randomSeed,
+          // random 模式一律沿用持久化的穩定 seed（與手動排序共用同一來源），
+          // 自動排序不自行重抽，確保目標順序冪等、可收斂。
+          randomSeed: undefined,
           pinnedTop: settings.pinnedTop,
           pinnedBottom: settings.pinnedBottom,
           foldersFirst: settings.foldersFirst,
           folderRules: settings.folderRules,
         })
-        // 缺陷 3：只有 status === 'completed' 才從 pending 移除
+        // 只有 completed 才從 pending 移除；且排序期間若有新需求（版本號已變）不得誤刪
         if (res.status === 'completed') {
-          const current = await readPending()
-          current.delete(folderId)
-          await writePending(current)
+          await scoped(async () => {
+            if ((versions.get(folderId) ?? 0) !== version)
+              return
+            const current = await readPending()
+            current.delete(folderId)
+            await writePending(current)
+          })
         }
         // 非 completed（failed / stopped-external / awaiting-user）：**保留** pending
       }
@@ -275,10 +314,19 @@ async function flush(): Promise<void> {
   finally {
     flushing = false
     if (!treeUnavailable) {
-      // 若 flush 期間又新增了尚未嘗試的資料夾，再排一次；
-      // 已嘗試但失敗者仍在 attempted，不會被立即重試。
-      const left = await readPending()
-      if ([...left].some(id => !attempted.has(id)))
+      // 若 flush 期間又新增了尚未嘗試的資料夾，或排序期間版本號已變（有新需求），
+      // 再排一次；已嘗試但失敗且沒有新需求者不會被立即重試。
+      const needsMore = await scoped(async () => {
+        const left = await readPending()
+        for (const id of left) {
+          if (!attempted.has(id))
+            return true
+          if ((versions.get(id) ?? 0) !== (claimed.get(id) ?? 0))
+            return true
+        }
+        return false
+      })
+      if (needsMore)
         scheduleFlush()
     }
   }
@@ -288,7 +336,7 @@ async function flush(): Promise<void> {
 export async function resumeNativeSortAutoOnStartup(): Promise<void> {
   if (typeof chrome === 'undefined' || !chrome.storage?.session)
     return
-  const pending = await readPending()
+  const pending = await scoped(() => readPending())
   if (pending.size > 0)
     scheduleFlush()
 }

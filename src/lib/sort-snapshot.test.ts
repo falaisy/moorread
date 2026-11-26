@@ -4,6 +4,7 @@ import {
   buildRestorePlan,
   captureSnapshot,
   isNodeInOriginalPlace,
+  isValidSnapshot,
   planFolderMoves,
 } from './sort-snapshot'
 
@@ -90,6 +91,36 @@ describe('buildRestorePlan', () => {
     const r2 = buildRestorePlan(snap, current)
     expect(r1.targets).toEqual(r2.targets)
     expect(r1.stats).toEqual(r2.stats)
+  })
+
+  it('資料夾被搬到別的父層後，仍依快照復原其內部順序（不做祖先鏈核對）', () => {
+    const snap2 = captureSnapshot(treeWith({
+      1: [folder('2', [bm('X', 0), bm('Y', 1)])],
+      2: [bm('X', 0), bm('Y', 1)],
+    }), ['1', '2'])
+    // folder 2 現在在別的父層，但其 id 與內部子節點仍存在
+    const current = { 1: ['2'], 2: ['Y', 'X'] }
+    const { targets } = buildRestorePlan(snap2, current)
+    expect(targets.find(t => t.folderId === '2')!.order).toEqual(['X', 'Y'])
+  })
+})
+
+describe('isValidSnapshot — 格式錯誤不得靜默採用', () => {
+  it('accepts a captured snapshot', () => {
+    const snap = captureSnapshot(treeWith({ 1: [bm('A', 0), bm('B', 1)] }), ['1'])
+    expect(isValidSnapshot(snap)).toBe(true)
+  })
+
+  it('rejects malformed values', () => {
+    expect(isValidSnapshot(null)).toBe(false)
+    expect(isValidSnapshot({})).toBe(false)
+    expect(isValidSnapshot({ capturedAt: 1, folderOrders: {}, nodes: {} })).toBe(false)
+    expect(isValidSnapshot({
+      capturedAt: 1,
+      folderOrders: { 1: 'not-an-array' },
+      nodes: {},
+      scopeFolderIds: ['1'],
+    })).toBe(false)
   })
 })
 
